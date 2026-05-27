@@ -1,3 +1,10 @@
+# train.py – 解耦训练流程
+# 包含：
+#   DecoupledTrainer → 水动力 / 输沙 / 河床 / 级配 四模型交替训练器
+#   build_boundary_conditions → 边界条件构建
+#   run_hump_evolution_test   → hump 算例一键运行入口
+#   compute_ic_weight         → 初始条件损失权重衰减函数
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -6,6 +13,7 @@ from tqdm import trange
 from .config import (
     AG_VALUES,
     BBOX,
+    BC_DEFAULT,
     BOUNDS,
     GRAIN_DIAMETERS,
     N_GAUSS_POINTS,
@@ -20,6 +28,10 @@ from .data import FVMeshPreprocessor
 from .evaluate import visualize_results
 from .model import FlowPINN, BedPINN, SedimentPINN, GradationPINN
 from .physics import SVEsPhysicsLoss, SedimentTransportLoss, ExnerPhysicsLoss
+
+
+def compute_ic_weight(T_norm: float, w_max: float = 30.0, w_min: float = 5.0) -> float:
+    return max(w_min, w_max * (1 - T_norm))
 
 
 def hump_initial_bed(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -234,8 +246,9 @@ class DecoupledTrainer:
             zb_new = self.bed_model(xyT).squeeze().cpu().numpy()
         self.mesh.update_bed(zb_new)
         return zb_new
-    # 预训练：在正式的耦合训练之前，先单独训练河床模型，使其能够拟合初始的河床形态。
+
     def pretrain_ic(self, n_epochs):
+        """预训练：在正式的耦合训练之前，先单独训练河床模型，使其能够拟合初始的河床形态。"""
         self.bed_model.train()
         cx = torch.tensor(self.mesh.cell_centers_x, dtype=torch.float32, device=self.device)
         cy = torch.tensor(self.mesh.cell_centers_y, dtype=torch.float32, device=self.device)
@@ -246,12 +259,12 @@ class DecoupledTrainer:
         T0 = torch.zeros(self.mesh.n_cells, dtype=torch.float32, device=self.device)
         xyT0 = torch.stack([cx, cy, T0], dim=1)
         zb_t = torch.tensor(self.mesh.zb_initial, dtype=torch.float32, device=self.device).unsqueeze(1)
-        opt = torch.optim.Adam(self.bed_model.parameters(), lr=5e-4)
         for ep in range(n_epochs):
-            opt.zero_grad()
+            self.bed_optimizer.zero_grad()
             loss = F.mse_loss(self.bed_model(xyT0), zb_t)
             loss.backward()
-            opt.step()
+            self.bed_optimizer.step()
+        self.bed_optimizer.state.clear()
         return loss.item()
 
     def _compute_flow_data_loss(self, coords, values, mask=None):
@@ -279,7 +292,7 @@ class DecoupledTrainer:
             if verbose and T_step % 10 == 0:
                 print(f'  T={T_step}: 训练床面/总输沙/级配模型...')
             
-            sediment_loss = self.train_sediment_phase(sediment_epochs_per_step, T_norm, w_ic=max(5.0, 30.0 * (1 - T_norm)))
+            sediment_loss = self.train_sediment_phase(sediment_epochs_per_step, T_norm, w_ic=compute_ic_weight(T_norm))
             
             current_bed = self.update_bed_from_model(T_norm)
             bed_history.append(current_bed.copy())
@@ -294,16 +307,24 @@ class DecoupledTrainer:
         return bed_history
 
 
-def build_boundary_conditions(n_bc=50, t_norm=0.5):
+def build_boundary_conditions(n_bc=None, t_norm=None):
+    if n_bc is None:
+        n_bc = int(BC_DEFAULT['n_bc'])
+    if t_norm is None:
+        t_norm = BC_DEFAULT['t_normalized']
+    h_norm = BC_DEFAULT['h_norm']
+    u_norm = BC_DEFAULT['u_norm']
+    v_norm = BC_DEFAULT['v_norm']
+
     y_inlet = np.linspace(0, 1000, n_bc)
     coords_inlet = np.stack([np.zeros(n_bc), y_inlet / 1000.0, np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
-    values_inlet = np.array([[1.0, 1.0, 0.5]] * n_bc, dtype=np.float32)
+    values_inlet = np.array([[h_norm, u_norm, v_norm]] * n_bc, dtype=np.float32)
     mask_inlet = np.array([[1.0, 1.0, 1.0]] * n_bc, dtype=np.float32)
 
     x_wall = np.linspace(0, 1000, n_bc)
     coords_wall_bot = np.stack([x_wall / 1000.0, np.zeros(n_bc), np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
     coords_wall_top = np.stack([x_wall / 1000.0, np.ones(n_bc), np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
-    values_wall = np.array([[1.0, 1.0, 0.5]] * n_bc, dtype=np.float32)
+    values_wall = np.array([[h_norm, u_norm, v_norm]] * n_bc, dtype=np.float32)
     mask_wall = np.array([[0.0, 0.0, 1.0]] * n_bc, dtype=np.float32)
 
     bc_coords = np.concatenate([coords_inlet, coords_wall_bot, coords_wall_top], axis=0)
@@ -384,7 +405,7 @@ def run_hump_evolution_test(regime='fast'):
         gradation_lr=TRAINING_SETTINGS['gradation_lr'],
     )
 
-    bc_coords, bc_values, bc_mask = build_boundary_conditions(n_bc=50, t_norm=0.5)
+    bc_coords, bc_values, bc_mask = build_boundary_conditions()
     
     bed_history = trainer.run_decoupled_training(
         n_macro_steps=TRAINING_SETTINGS['n_macro_steps'],   # 宏步数

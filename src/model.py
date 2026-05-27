@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import EPS_DIVISION, EPS_SAFE
+
 
 class ResBlock(nn.Module):
     """残差块：两个全连接层 + Tanh 激活 + 跳跃连接。
@@ -77,7 +79,7 @@ class BasePINN(nn.Module):
 class FlowPINN(BasePINN):
     """水动力 PINN：输入 (x, y, t)，输出归一化的 (h, u, v)。
 
-    输出经过 Sigmoid 约束到 [0, 1]，再由损失函数反归一化到物理量：
+    输出经过 Sigmoid 约束到 [0, 1]，再由 decode_output 反归一化到物理量：
         h = h_norm * typical_h
         u = (u_norm - 0.5) * 2 * typical_u
         v = (v_norm - 0.5) * 2 * typical_u
@@ -85,6 +87,15 @@ class FlowPINN(BasePINN):
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4, output_dim=3):
         super().__init__(input_dim, hidden_dim, num_block, output_dim,
                          final_activation=nn.Sigmoid())
+
+    @staticmethod
+    def decode_output(
+        raw: torch.Tensor, typical_h: float, typical_u: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = raw[:, 0:1] * typical_h
+        u = (raw[:, 1:2] - 0.5) * 2.0 * typical_u
+        v = (raw[:, 2:3] - 0.5) * 2.0 * typical_u
+        return h, u, v
 
 
 class SedimentPINN(BasePINN):
@@ -173,8 +184,7 @@ class SedimentPINN(BasePINN):
         残差 R_Ck = 储量项 + 对流项 - 扩散项 - 源 + 汇。
         理想情况下 R_Ck = 0。
         """
-        eps = 1e-8
-        beta_safe = torch.clamp(beta_tk, min=eps)          # 防止除以零
+        beta_safe = torch.clamp(beta_tk, min=EPS_DIVISION)   # 防止除以零
 
         # ① 储量项：∂(h C_tk / β_tk) / ∂t
         storage = h * C_tk / beta_safe
@@ -204,7 +214,7 @@ class SedimentPINN(BasePINN):
 
     @staticmethod
     def grass_formula(u: torch.Tensor, v: torch.Tensor,
-                      Ag=0.001, m=3, eps=1e-6):
+                      Ag=0.001, m=3, eps=EPS_SAFE):
         """Grass 简化输沙通量公式。
 
         qx = Ag * u * |U|^(m-1)
@@ -296,7 +306,7 @@ class GradationPINN(BasePINN):
         if not torch.is_tensor(rho_s):
             rho_s = torch.as_tensor(rho_s, dtype=p_k.dtype, device=p_k.device)
 
-        exchange = (D_k - E_k) / (rho_s + 1e-8)     # 净沉积体积通量
+        exchange = (D_k - E_k) / (rho_s + EPS_DIVISION)  # 净沉积体积通量
         total_exchange = torch.sum(exchange, dim=1, keepdim=True)
         storage = L_a * p_k
         storage_t = SedimentPINN._dt(storage, xyt)   # ∂(L_a p_k)/∂t

@@ -1,11 +1,17 @@
-# 地形数据处理
+# data.py – 地形与网格数据预处理
+# 包含：
+#   FVMeshPreprocessor    → FVM 结构化网格生成、高斯积分点预计算、床面梯度
+#   DemPreprocessor       → DEM GeoTIFF 读取与局部坐标转换
+#   SedimentDataProcessor → 河床粒径级配数据解析
+
 import importlib
-import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 from scipy import ndimage
+
 
 class FVMeshPreprocessor:
     def __init__(self, bbox, resolution, initial_bed=None, n_gauss_points=2):
@@ -110,6 +116,28 @@ class FVMeshPreprocessor:
             dzb_dy[0, :] = (zb_2d[1, :] - zb_2d[0, :]) / self.resolution
             dzb_dy[-1, :] = (zb_2d[-1, :] - zb_2d[-2, :]) / self.resolution
 
+        return dzb_dx.flatten(), dzb_dy.flatten()
+
+    def get_bed_gradient_tensor(self, zb_tensor, device):
+        """统一的床面梯度计算，支持 NumPy (zb_tensor=None) 和 PyTorch 张量两种输入。"""
+        if zb_tensor is None:
+            dzb_dx, dzb_dy = self.get_bed_gradient()
+            return (torch.tensor(dzb_dx, dtype=torch.float32, device=device),
+                    torch.tensor(dzb_dy, dtype=torch.float32, device=device))
+
+        zb = zb_tensor.to(dtype=torch.float32, device=device).reshape(self.ny, self.nx)
+        dzb_dx = torch.zeros_like(zb)
+        dzb_dy = torch.zeros_like(zb)
+        if self.nx > 1:
+            if self.nx > 2:
+                dzb_dx[:, 1:-1] = (zb[:, 2:] - zb[:, :-2]) / (2 * self.resolution)
+            dzb_dx[:, 0] = (zb[:, 1] - zb[:, 0]) / self.resolution
+            dzb_dx[:, -1] = (zb[:, -1] - zb[:, -2]) / self.resolution
+        if self.ny > 1:
+            if self.ny > 2:
+                dzb_dy[1:-1, :] = (zb[2:, :] - zb[:-2, :]) / (2 * self.resolution)
+            dzb_dy[0, :] = (zb[1, :] - zb[0, :]) / self.resolution
+            dzb_dy[-1, :] = (zb[-1, :] - zb[-2, :]) / self.resolution
         return dzb_dx.flatten(), dzb_dy.flatten()
 
 # 英尺到米的转换系数
@@ -231,31 +259,36 @@ class DemPreprocessor:
         }
 
 
-class DedimentDataProcessor:
+class SedimentDataProcessor:
     """河床粒径数据处理类"""
 
-    def __init__(self, BedTemplate, BedGradation, GradationLayers):
-        """初始化河床粒径数据，并转换为局部坐标系。"""
-        self.BedTemplate = BedTemplate  # 不同区域的河床材料模板
-        self.GradationLayers = GradationLayers # 分层结构()
-        self.BedGradation = BedGradation    # 床沙级配
+    def __init__(self, bed_template, bed_gradation, gradation_layers):
+        self.bed_template = bed_template
+        self.gradation_layers = gradation_layers
+        self.bed_gradation = bed_gradation
+
+    @classmethod
+    def from_excel(cls, path, sheet_name="Sediment Data", skiprows=2):
+        """从 Excel 文件解析河床粒径数据。"""
+        df = pd.read_excel(path, sheet_name=sheet_name, skiprows=skiprows, header=None).ffill()
+
+        bed_template = dict(zip(df.iloc[:3, 2:4].iloc[:, 0], df.iloc[:3, 2:4].iloc[:, 1]))
+
+        gradation_layers = df.iloc[27:, 1:4].ffill(axis=0)
+        gradation_layers.columns = gradation_layers.iloc[0]
+        gradation_layers = gradation_layers.iloc[1:].reset_index(drop=True)
+
+        bed_gradation = df.iloc[6:27, 1:6].replace({np.nan: 0})
+        bed_gradation.columns = bed_gradation.iloc[0]
+        bed_gradation = bed_gradation.iloc[1:].reset_index(drop=True)
+
+        return cls(bed_template, bed_gradation, gradation_layers)
 
 
 if __name__ == "__main__":
-    # tif_path = "data/100ft.test1d.tif"
-    # dem = DemPreprocessor(tif_path, river_elevation_max_m=680, river_elevation_min_m=0).to_dict()
-    # print(dem)
-
     bed_path = "data/FlowSedimentData.xlsx"
-    df = pd.read_excel(bed_path, sheet_name="Sediment Data",skiprows=2, header=None).ffill()
-    # 不同区域的河床材料模板
-    BedTemplate = dict(zip(df.iloc[:3, 2:4].iloc[:, 0], df.iloc[:3, 2:4].iloc[:, 1]))
-    # 分层结构
-    GradationLayers = df.iloc[27:, 1:4].ffill(axis=0)
-    GradationLayers.columns = GradationLayers.iloc[0]
-    GradationLayers = GradationLayers.iloc[1:].reset_index(drop=True)
-    # 床沙级配
-    BedGradation = df.iloc[6:27, 1:6].replace({np.nan: 0})
-    BedGradation.columns = BedGradation.iloc[0]
-    BedGradation = BedGradation.iloc[1:].reset_index(drop=True)
+    processor = SedimentDataProcessor.from_excel(bed_path)
+    print(processor.bed_template)
+    print(processor.bed_gradation)
+    print(processor.gradation_layers)
 

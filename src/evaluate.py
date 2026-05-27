@@ -1,4 +1,11 @@
+# evaluate.py – 训练结果可视化
+# 绘制床面演化等高线、中心线/横断面剖面、训练历史曲线和扩散角验证图。
+
+import os
+
 import numpy as np
+
+from .config import EPS_SAFE
 
 try:
     import matplotlib
@@ -10,10 +17,17 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 
-def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, Ag, regime='fast'):
+def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, Ag, regime='fast', output_dir=None):
     if not HAS_MATPLOTLIB:
         print('\n未安装 matplotlib，跳过结果绘图；训练历史和 bed_history 仍会返回。')
         return
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+
+    def _save_path(name):
+        path = f'{regime}_{name}.png'
+        return os.path.join(output_dir, path) if output_dir else path
 
     nx = int((bbox['xmax'] - bbox['xmin']) / resolution)
     ny = int((bbox['ymax'] - bbox['ymin']) / resolution)
@@ -40,9 +54,9 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
         ax.plot([500, 700, 700, 500, 500], [400, 400, 600, 600, 400], 'r--', lw=1, alpha=0.5)
     plt.suptitle(f'床面演化 A={Ag}', fontsize=13)
     plt.tight_layout()
-    plt.savefig(f'{regime}_bed_slow2.png', dpi=150, bbox_inches='tight')
+    plt.savefig(_save_path('bed'), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'\n✓ {regime}_bed.png')
+    print(f'\n✓ {_save_path("bed")}')
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     j500 = np.argmin(np.abs(yc - 500))
@@ -66,9 +80,9 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
     axes[0].set_xlabel('x(m)')
     axes[1].set_xlabel('y(m)')
     plt.tight_layout()
-    plt.savefig(f'{regime}_profiles_slow2.png', dpi=150, bbox_inches='tight')
+    plt.savefig(_save_path('profiles'), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'✓ {regime}_profiles.png')
+    print(f'✓ {_save_path("profiles")}')
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
     def pl(ax, d, lb, c, ls='-'):
@@ -102,9 +116,9 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
         axes[1, 1].grid(alpha=0.3)
     plt.suptitle(f'训练历史 A={Ag}')
     plt.tight_layout()
-    plt.savefig(f'{regime}_losses_slow2.png', dpi=150, bbox_inches='tight')
+    plt.savefig(_save_path('losses'), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f'✓ {regime}_losses.png')
+    print(f'✓ {_save_path("losses")}')
     if Ag < 0.01:
         zb_f = bed_history[-1].reshape(ny, nx)
         fig, ax = plt.subplots(figsize=(7, 7))
@@ -124,10 +138,10 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
         ax.set_aspect('equal')
         ax.legend()
         plt.tight_layout()
-        plt.savefig(f'{regime}_angle.png', dpi=150, bbox_inches='tight')
+        plt.savefig(_save_path('angle'), dpi=150, bbox_inches='tight')
         plt.close()
-        print(f'✓ {regime}_angle.png (理论扩散角={theta:.2f}°)')
+        print(f'✓ {_save_path("angle")} (理论扩散角={theta:.2f}°)')
 
     dz = bed_history[-1].max() - bed_history[0].max()
     print(f'\n  初始峰值: {bed_history[0].max():.4f}m  最终峰值: {bed_history[-1].max():.4f}m')
-    print(f'  峰值变化: {dz:+.4f}m ({dz / max(bed_history[0].max(), 1e-6) * 100:.1f}%)')
+    print(f'  峰值变化: {dz:+.4f}m ({dz / max(bed_history[0].max(), EPS_SAFE) * 100:.1f}%)')
