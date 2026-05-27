@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+*.so
+
+# Virtual environment
+venv/
+.env/
+.venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project data & output
+data/*
+!data/.gitkeep
+output/*
+!output/.gitkeep
+
+# Image / generated files
+image/
+*.tif
+*.tiff
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Logs
+*.log
