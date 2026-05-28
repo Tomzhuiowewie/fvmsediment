@@ -1,9 +1,8 @@
 # train.py – 解耦训练流程
 # 包含：
-#   DecoupledTrainer → 水动力 / 输沙 / 河床 / 级配 四模型交替训练器
+#   DecoupledTrainer → 水动力 / 输沙训练 + Exner 显式河床更新
 #   build_boundary_conditions → 边界条件构建
 #   run_hump_evolution_test   → hump 算例一键运行入口
-#   compute_ic_weight         → 初始条件损失权重衰减函数
 
 import numpy as np
 import torch
@@ -16,7 +15,7 @@ from .config import (
     BC_DEFAULT,
     BOUNDS,
     GRAIN_DIAMETERS,
-    INCLUDE_FLOW_TIME_TERMS,
+    INCLUDE_TIME_TERMS,
     N_GAUSS_POINTS,
     NUM_GRAIN_CLASSES,
     RESOLUTION,
@@ -27,12 +26,8 @@ from .config import (
 )
 from .data import FVMeshPreprocessor
 from .evaluate import visualize_results
-from .model import FlowPINN, BedPINN, SedimentPINN
-from .physics import SVEsPhysicsLoss, SedimentTransportLoss, ExnerPhysicsLoss
-
-
-def compute_ic_weight(T_norm: float, w_max: float = 30.0, w_min: float = 5.0) -> float:
-    return max(w_min, w_max * (1 - T_norm))
+from .model import FlowPINN, SedimentPINN
+from .physics import SVEsPhysicsLoss, SedimentTransportLoss
 
 
 def hump_initial_bed(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -50,27 +45,28 @@ class DecoupledTrainer:
         self,
         flow_model,
         sediment_model,
-        bed_model,
         fvm_mesh,
         device,
         flow_loss_fn,
         sediment_transport_loss_fn,
-        exner_loss_fn,
+        T_physical,
+        porosity=0.4,
         flow_lr=1e-4,
         transport_lr=1e-4,
-        bed_lr=1e-4,
     ):
         self.flow_model = flow_model
         self.sediment_model = sediment_model
-        self.bed_model = bed_model
         self.mesh = fvm_mesh
         self.device = device
         self.flow_loss_fn = flow_loss_fn
         self.sediment_transport_loss_fn = sediment_transport_loss_fn
-        self.exner_loss_fn = exner_loss_fn
-        self.last_delta = np.zeros(self.mesh.n_cells, dtype=np.float32)
+        self.T_physical = T_physical
+        self.porosity = porosity
+        self.xi = 1.0 / (1.0 - porosity)
+        self.rho_bulk = self.sediment_transport_loss_fn.rho_s * (1.0 - porosity)
         self.last_bed = self.mesh.zb.copy()
         self.macro_dt_physical = 1.0
+        self.current_morph_dt_physical = 1.0
 
         n_grains = len(self.sediment_transport_loss_fn.grain_diameters or GRAIN_DIAMETERS)
         self.active_layer_frac = np.full((self.mesh.n_cells, n_grains), 1.0 / n_grains, dtype=np.float32)
@@ -86,30 +82,31 @@ class DecoupledTrainer:
             if self.sediment_model is not None else None
         )
 
-        # 河床模型优化器（Exner方程）
-        self.bed_optimizer = torch.optim.Adam(self.bed_model.parameters(), lr=bed_lr)
-
         # 学习率调度器：根据损失变化自动调整学习率，帮助训练更稳定地收敛
         self.flow_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.flow_optimizer, 'min', factor=0.5, patience=500)
         self.sediment_scheduler = (
             torch.optim.lr_scheduler.ReduceLROnPlateau(self.sediment_optimizer, 'min', factor=0.5, patience=500)
             if self.sediment_optimizer is not None else None
         )
-        self.bed_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.bed_optimizer, 'min', factor=0.5, patience=500)
 
         self.history = {
             'flow_loss': [],    # 水动力损失（SVEs PDE残差 + BC损失）
-            'sediment_loss': [],    # 河床演化损失（Exner PDE残差 + IC损失）
+            'sediment_loss': [],    # 输沙总损失（输沙 PDE 残差 + 容量损失）
             'transport_loss': [],   # 输沙损失（浓度对流扩散）
             'gradation_loss': [],   # 显式级配更新占位记录
             'capacity_loss': [],    # 容量损失()
             'continuity': [],   # 连续性损失
             'momentum_x': [],
             'momentum_y': [],
-            'exner': [],
+            'exner_dzb_dt_min': [],
+            'exner_dzb_dt_max': [],
+            'bed_dt_scale': [],
+            'bed_dt_effective': [],
+            'bed_delta_max': [],
+            'flow_extra_epochs': [],
+            'sediment_extra_epochs': [],
             'zb_min': [],
             'zb_max': [],
-            'ic': [],
             'C_min': [],
             'C_max': [],
             'p_min': [],
@@ -129,26 +126,22 @@ class DecoupledTrainer:
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.flow_model.parameters(), max_norm=1.0)
             self.flow_optimizer.step()
-            self.flow_scheduler.step(total_loss)
+            self.flow_scheduler.step(total_loss.detach())
             self.history['flow_loss'].append(total_loss.item())
             self.history['continuity'].append(loss_dict['continuity'])
             self.history['momentum_x'].append(loss_dict['momentum_x'])
             self.history['momentum_y'].append(loss_dict['momentum_y'])
         return total_loss.item()
 
-    def train_sediment_phase(self, n_epochs, T, w_ic=10.0):
+    def train_sediment_phase(self, n_epochs, T):
         self.flow_model.eval()
         p_k_gauss = self._gradation_at_gauss_tensor()
+        total_loss = torch.tensor(0.0, device=self.device)
 
         for epoch in range(n_epochs):
-            # =====================================================
-            # Step 1: 更新输沙模型 sediment_model（水体浓度 C_tk）
-            #   固定：flow_model, bed_model, active_layer_frac
-            # =====================================================
             sediment_dict = None
             if self.sediment_model is not None and self.sediment_optimizer is not None:
                 self.sediment_model.train()
-                self.bed_model.eval()
 
                 self.sediment_optimizer.zero_grad()
                 sediment_loss, sediment_dict = self.sediment_transport_loss_fn.compute_sediment_loss(
@@ -160,37 +153,9 @@ class DecoupledTrainer:
                 self.sediment_optimizer.step()
                 if self.sediment_scheduler is not None:
                     self.sediment_scheduler.step(sediment_loss.detach())
-
-            # =====================================================
-            # Step 2: 更新河床模型 bed_model（Exner 方程）
-            #   固定：flow_model, sediment_model, active_layer_frac
-            # =====================================================
-            if self.sediment_model is not None:
-                self.sediment_model.eval()
-            self.bed_model.train()
-
-            self.bed_optimizer.zero_grad()
-            bed_loss, loss_dict = self.exner_loss_fn.compute_loss(
-                self.bed_model, self.flow_model, T, self.device, w_ic=w_ic,
-                sediment_model=self.sediment_model,
-                p_k_override=p_k_gauss,
-                sediment_transport_loss_fn=self.sediment_transport_loss_fn,
-            )
-            bed_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.bed_model.parameters(), max_norm=1.0)
-            self.bed_optimizer.step()
-            self.bed_scheduler.step(bed_loss.detach())
-
-            # =====================================================
-            # 记录历史
-            # =====================================================
-            total_loss = bed_loss.detach()
-            if sediment_dict is not None:
-                total_loss = total_loss + sediment_dict['transport'] + sediment_dict['capacity']
+                total_loss = sediment_loss.detach()
 
             self.history['sediment_loss'].append(total_loss.item())
-            self.history['exner'].append(loss_dict['exner'])
-            self.history['ic'].append(loss_dict['ic'])
             if sediment_dict is not None:
                 self.history['transport_loss'].append(sediment_dict['transport'])
                 self.history['capacity_loss'].append(sediment_dict['capacity'])
@@ -233,9 +198,9 @@ class DecoupledTrainer:
         nc = self.mesh.n_cells
         n_grains = self.active_layer_frac.shape[1]
         net_deposition_rate = (closure['D_tk'] - closure['E_tk']).detach().view(nc, npp, n_grains).mean(dim=1)
-        delta_m_bed = net_deposition_rate.cpu().numpy() * self.macro_dt_physical
+        delta_m_bed = net_deposition_rate.cpu().numpy() * self.current_morph_dt_physical
 
-        rho_bulk = self.sediment_transport_loss_fn.rho_s / max(self.exner_loss_fn.xi, 1.0e-6)
+        rho_bulk = self.rho_bulk
         m1_old = self.active_layer_frac * rho_bulk
         m2_old = self.second_layer_frac * rho_bulk
 
@@ -262,43 +227,69 @@ class DecoupledTrainer:
         self.history['p_max'].append(float(np.max(self.active_layer_frac)))
         return self.active_layer_frac
 
-    def update_bed_from_model(self, T):
-        self.bed_model.eval()
-        with torch.no_grad():
-            x_centers = torch.tensor(self.mesh.cell_centers_x, dtype=torch.float32, device=self.device)
-            y_centers = torch.tensor(self.mesh.cell_centers_y, dtype=torch.float32, device=self.device)
-            T_tensor = torch.full_like(x_centers, T)
-            if self.flow_loss_fn.bounds is not None:
-                bounds = self.flow_loss_fn.bounds
-                x_norm = (x_centers - bounds['x_min']) / (bounds['x_max'] - bounds['x_min'])
-                y_norm = (y_centers - bounds['y_min']) / (bounds['y_max'] - bounds['y_min'])
-            else:
-                x_norm = x_centers
-                y_norm = y_centers
-            xyT = torch.stack([x_norm, y_norm, T_tensor], dim=1)
-            zb_new = self.bed_model(xyT).squeeze().cpu().numpy()
-        self.mesh.update_bed(zb_new)
-        return zb_new
+    def _exner_dzb_dt_cell(self, T):
+        """用总输沙通量边界积分显式计算每个单元的床面变化率。"""
+        if self.sediment_model is None:
+            return np.zeros(self.mesh.n_cells, dtype=np.float32)
 
-    def pretrain_ic(self, n_epochs):
-        """预训练：在正式的耦合训练之前，先单独训练河床模型，使其能够拟合初始的河床形态。"""
-        self.bed_model.train()
-        cx = torch.tensor(self.mesh.cell_centers_x, dtype=torch.float32, device=self.device)
-        cy = torch.tensor(self.mesh.cell_centers_y, dtype=torch.float32, device=self.device)
-        b = self.flow_loss_fn.bounds
-        if b:
-            cx = (cx - b['x_min']) / (b['x_max'] - b['x_min'])
-            cy = (cy - b['y_min']) / (b['y_max'] - b['y_min'])
-        T0 = torch.zeros(self.mesh.n_cells, dtype=torch.float32, device=self.device)
-        xyT0 = torch.stack([cx, cy, T0], dim=1)
-        zb_t = torch.tensor(self.mesh.zb_initial, dtype=torch.float32, device=self.device).unsqueeze(1)
-        for ep in range(n_epochs):
-            self.bed_optimizer.zero_grad()
-            loss = F.mse_loss(self.bed_model(xyT0), zb_t)
-            loss.backward()
-            self.bed_optimizer.step()
-        self.bed_optimizer.state.clear()
-        return loss.item()
+        self.flow_model.eval()
+        self.sediment_model.eval()
+        p_k_gauss = self._gradation_at_gauss_tensor()
+
+        closure = self.sediment_transport_loss_fn.compute_closure(
+            self.sediment_model,
+            self.flow_model,
+            T,
+            self.device,
+            p_k_override=p_k_gauss,
+            freeze_flow_params=True,
+        )
+
+        npp = self.mesh.n_points_per_cell
+        nc = self.mesh.n_cells
+        loss_fn = self.sediment_transport_loss_fn
+        weights = loss_fn._gauss_weights_t.view(nc, npp, 1)
+        nx = loss_fn._gauss_normals_t[:, 0:1]
+        ny = loss_fn._gauss_normals_t[:, 1:2]
+
+        h = closure['h']
+        u = closure['u']
+        v = closure['v']
+        C_tk = closure['C_tk']
+        epsilon_thk = closure['epsilon_thk']
+
+        adv_flux = h * C_tk * (u * nx + v * ny)
+        Cx = loss_fn._physical_grad(C_tk, closure['xyt'], 0)
+        Cy = loss_fn._physical_grad(C_tk, closure['xyt'], 1)
+        diff_flux = epsilon_thk * h * (Cx * nx + Cy * ny)
+        total_sediment_flux = torch.sum(adv_flux - diff_flux, dim=1, keepdim=True)
+
+        boundary_integral = torch.sum(
+            total_sediment_flux.view(nc, npp, 1) * weights,
+            dim=1,
+        ).squeeze(1)
+        dzb_dt = -self.xi * boundary_integral / (
+            (loss_fn.rho_s + 1.0e-8) * self.mesh.cell_area
+        )
+        return dzb_dt.detach().cpu().numpy().astype(np.float32)
+
+    def update_bed_explicit(self, T, max_bed_change_per_step=None):
+        dzb_dt = self._exner_dzb_dt_cell(T)
+        raw_delta_zb = dzb_dt * self.macro_dt_physical
+        max_delta = float(np.max(np.abs(raw_delta_zb))) if raw_delta_zb.size else 0.0
+        dt_scale = 1.0
+        if max_bed_change_per_step is not None and max_bed_change_per_step > 0.0 and max_delta > max_bed_change_per_step:
+            dt_scale = max_bed_change_per_step / max(max_delta, 1.0e-12)
+
+        self.current_morph_dt_physical = self.macro_dt_physical * dt_scale
+        new_bed = self.mesh.zb.astype(np.float32) + dzb_dt * self.current_morph_dt_physical
+        self.mesh.update_bed(new_bed)
+        self.history['exner_dzb_dt_min'].append(float(np.min(dzb_dt)))
+        self.history['exner_dzb_dt_max'].append(float(np.max(dzb_dt)))
+        self.history['bed_dt_scale'].append(float(dt_scale))
+        self.history['bed_dt_effective'].append(float(self.current_morph_dt_physical))
+        self.history['bed_delta_max'].append(float(max_delta * dt_scale))
+        return new_bed
 
     def _compute_flow_data_loss(self, coords, values, mask=None):
         coords_tensor = torch.tensor(coords, dtype=torch.float32, device=self.device)
@@ -310,25 +301,60 @@ class DecoupledTrainer:
         diff2 = (predictions - targets) ** 2 * mask_tensor
         return diff2.sum() / torch.clamp(mask_tensor.sum(), min=1.0)
 
-    def run_decoupled_training(self, n_macro_steps, flow_epochs_per_step, sediment_epochs_per_step, bc_coords=None, bc_values=None, bc_mask=None, warmup_ic_epochs=600, verbose=True):
-        self.pretrain_ic(warmup_ic_epochs)
-        self.macro_dt_physical = self.exner_loss_fn.T_physical / max(n_macro_steps - 1, 1)
+    def run_decoupled_training(
+        self,
+        n_macro_steps,
+        flow_epochs_per_step,
+        sediment_epochs_per_step,
+        bc_coords=None,
+        bc_values=None,
+        bc_mask=None,
+        flow_loss_tol=1e-4,
+        sediment_loss_tol=1e-4,
+        extra_train_chunk=100,
+        max_extra_flow_epochs=0,
+        max_extra_sediment_epochs=0,
+        max_bed_change_per_step=None,
+        verbose=True,
+    ):
+        self.macro_dt_physical = self.T_physical / max(n_macro_steps - 1, 1)
         bed_history = [self.mesh.zb.copy()]
         
         for T_step in trange(n_macro_steps, desc='Macro Steps'):
-            T_norm = T_step / (n_macro_steps -1)
+            T_norm = T_step / max(n_macro_steps - 1, 1)
             
             if verbose and T_step % 10 == 0:
                 print(f'\n  T={T_step}: 训练水动力模型...')
             
             flow_loss = self.train_flow_phase(flow_epochs_per_step, T_norm, data_coords=bc_coords, data_values=bc_values, data_mask=bc_mask)
+            flow_extra_epochs = 0
+            while (
+                flow_loss > flow_loss_tol
+                and flow_extra_epochs < max_extra_flow_epochs
+                and extra_train_chunk > 0
+            ):
+                n_extra = min(extra_train_chunk, max_extra_flow_epochs - flow_extra_epochs)
+                flow_loss = self.train_flow_phase(n_extra, T_norm, data_coords=bc_coords, data_values=bc_values, data_mask=bc_mask)
+                flow_extra_epochs += n_extra
             
             if verbose and T_step % 10 == 0:
-                print(f'  T={T_step}: 训练床面/总输沙/级配模型...')
+                print(f'  T={T_step}: 训练沉积物输运模型，随后显式更新河床...')
             
-            sediment_loss = self.train_sediment_phase(sediment_epochs_per_step, T_norm, w_ic=compute_ic_weight(T_norm))
+            sediment_loss = self.train_sediment_phase(sediment_epochs_per_step, T_norm)
+            sediment_extra_epochs = 0
+            while (
+                sediment_loss > sediment_loss_tol
+                and sediment_extra_epochs < max_extra_sediment_epochs
+                and extra_train_chunk > 0
+            ):
+                n_extra = min(extra_train_chunk, max_extra_sediment_epochs - sediment_extra_epochs)
+                sediment_loss = self.train_sediment_phase(n_extra, T_norm)
+                sediment_extra_epochs += n_extra
             
-            current_bed = self.update_bed_from_model(T_norm)
+            self.history['flow_extra_epochs'].append(flow_extra_epochs)
+            self.history['sediment_extra_epochs'].append(sediment_extra_epochs)
+
+            current_bed = self.update_bed_explicit(T_norm, max_bed_change_per_step=max_bed_change_per_step)
             self.update_gradation_state(T_norm, current_bed)
             bed_history.append(current_bed.copy())
             
@@ -336,7 +362,14 @@ class DecoupledTrainer:
             self.history['zb_max'].append(np.max(current_bed))
             
             if verbose and T_step % 10 == 0:
-                print(f'\n  T={T_step}: Flow Loss={flow_loss:.2e}, Bed+Sed Loss={sediment_loss:.2e}')
+                print(f'\n  T={T_step}: Flow Loss={flow_loss:.2e}, Sed Loss={sediment_loss:.2e}')
+                if flow_extra_epochs or sediment_extra_epochs:
+                    print(f'    追加训练: flow={flow_extra_epochs}, sediment={sediment_extra_epochs} epochs')
+                if self.history['bed_dt_scale'][-1] < 1.0:
+                    print(
+                        f'    Exner限幅: dt_scale={self.history["bed_dt_scale"][-1]:.3f}, '
+                        f'max|dzb|={self.history["bed_delta_max"][-1]:.4f}m'
+                    )
                 print(f'    河床: [{np.min(current_bed):.4f}, {np.max(current_bed):.4f}]')
         
         return bed_history
@@ -408,8 +441,6 @@ def run_hump_evolution_test(regime='fast'):
     flow_model = FlowPINN(input_dim=3, hidden_dim=64, num_block=4, output_dim=3).to(device)
     # 2. 沉积物输运方程：预测水体中各粒径浓度 C_tk
     sediment_model = SedimentPINN(input_dim=3, hidden_dim=64, num_block=4, output_dim=NUM_GRAIN_CLASSES, positive_output=True).to(device)
-    # 3. 河床演化方程：预测河床高程 z_b（Exner方程）
-    bed_model = BedPINN(input_dim=3, hidden_dim=64, num_block=4, output_dim=1, zb_scale=1.5).to(device)
     # 水动力物理损失
     flow_loss_fn = SVEsPhysicsLoss(
         fvm_mesh=fvm_mesh, 
@@ -419,7 +450,7 @@ def run_hump_evolution_test(regime='fast'):
         typical_depth=TYPICAL_DEPTH,
         typical_velocity=TYPICAL_VELOCITY,
         T_physical=T_physical,
-        include_time_terms=INCLUDE_FLOW_TIME_TERMS,
+        include_time_terms=INCLUDE_TIME_TERMS,
     )
 
     # 沉积物输运物理损失（浓度对流扩散 + 级配）
@@ -436,35 +467,22 @@ def run_hump_evolution_test(regime='fast'):
         m=3,    # Exner 方程中沉积物输运率与水动力条件的非线性关系指数
         adaptation_length=50.0, # 适应长度，用于计算局部的适应性权重，单位米
         T_physical=T_physical,
+        include_time_terms=INCLUDE_TIME_TERMS,
         alpha_active_layer=10.0,    # 活动层厚度与特征粒径的比例系数，用于定义活动层厚度
         w_capacity=0.05,    # 容量损失权重
-    )
-
-    # 河床演化物理损失（Exner 方程）
-    exner_loss_fn = ExnerPhysicsLoss(
-        fvm_mesh=fvm_mesh,
-        porosity=0.4,
-        Ag=Ag,
-        m=3,
-        Q=10.0,
-        h0=10.0,
-        bounds=BOUNDS,
-        T_physical=T_physical,
-        typical_u=TYPICAL_VELOCITY,
     )
 
     trainer = DecoupledTrainer(
         flow_model=flow_model,
         sediment_model=sediment_model,
-        bed_model=bed_model,
         fvm_mesh=fvm_mesh,
         device=device,
         flow_loss_fn=flow_loss_fn,
         sediment_transport_loss_fn=sediment_transport_loss_fn,
-        exner_loss_fn=exner_loss_fn,
+        T_physical=T_physical,
+        porosity=0.4,
         flow_lr=TRAINING_SETTINGS['flow_lr'],
         transport_lr=TRAINING_SETTINGS['transport_lr'],
-        bed_lr=TRAINING_SETTINGS['sediment_lr'],
     )
 
     bc_coords, bc_values, bc_mask = build_boundary_conditions(bbox=BBOX, bounds=BOUNDS)
@@ -476,7 +494,12 @@ def run_hump_evolution_test(regime='fast'):
         bc_coords=bc_coords,
         bc_values=bc_values,
         bc_mask=bc_mask,
-        warmup_ic_epochs=TRAINING_SETTINGS['warmup_ic_epochs'],
+        flow_loss_tol=TRAINING_SETTINGS['flow_loss_tol'],
+        sediment_loss_tol=TRAINING_SETTINGS['sediment_loss_tol'],
+        extra_train_chunk=TRAINING_SETTINGS['extra_train_chunk'],
+        max_extra_flow_epochs=TRAINING_SETTINGS['max_extra_flow_epochs'],
+        max_extra_sediment_epochs=TRAINING_SETTINGS['max_extra_sediment_epochs'],
+        max_bed_change_per_step=TRAINING_SETTINGS['max_bed_change_per_step'],
         verbose=True,
     )
 

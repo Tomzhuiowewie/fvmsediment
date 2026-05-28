@@ -1,14 +1,11 @@
 # model.py – PINN 网络模型定义
-# 包含：残差块、基类 PINN、以及四个物理子网络
+# 包含：残差块、基类 PINN、以及两个物理子网络
 #   FlowPINN      → 水深 h、流速 u, v
 #   SedimentPINN  → 总输沙浓度 C_tk
-#   BedPINN       → 河床高程 z_b
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from .config import EPS_DIVISION, EPS_SAFE
 
 
 class ResBlock(nn.Module):
@@ -34,7 +31,7 @@ class BasePINN(nn.Module):
     """PINN 网络基类，封装公共的前向结构与 Xavier 初始化。
 
     结构：输入层 → N 个 ResBlock → 输出层（含可选的最终激活函数）。
-    所有子网络（Flow/Sediment/Bed/Gradation）均继承此类，
+    Flow/Sediment 子网络均继承此类，
     只需定制输出维度和最终激活即可。
     """
 
@@ -110,7 +107,6 @@ class SedimentPINN(BasePINN):
     """总输沙输移 PINN：输入 (x, y, t)，输出各粒径级总输沙浓度 C_tk。
 
     正向输出通过 softplus 保证 C_tk ≥ 0。
-    类中还包含总输沙 PDE 残差计算、Grass 输沙公式等静态方法。
     """
 
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4,
@@ -153,105 +149,3 @@ class SedimentPINN(BasePINN):
         if q.dim() == 1 or q.shape[1] == 1:
             return grad_one(q if q.dim() > 1 else q.unsqueeze(1))
         return torch.cat([grad_one(q[:, k:k + 1]) for k in range(q.shape[1])], dim=1)
-
-    @staticmethod
-    def _dx(q: torch.Tensor, xyt: torch.Tensor) -> torch.Tensor:
-        """∂q/∂x"""
-        return SedimentPINN._grad(q, xyt, 0)
-
-    @staticmethod
-    def _dy(q: torch.Tensor, xyt: torch.Tensor) -> torch.Tensor:
-        """∂q/∂y"""
-        return SedimentPINN._grad(q, xyt, 1)
-
-    @staticmethod
-    def _dt(q: torch.Tensor, xyt: torch.Tensor) -> torch.Tensor:
-        """∂q/∂t"""
-        return SedimentPINN._grad(q, xyt, 2)
-
-    # ---------- HEC-RAS 总输沙输移方程 ----------
-
-    @staticmethod
-    def total_load_residual(
-        xyt: torch.Tensor,
-        h: torch.Tensor,   # 水深
-        u: torch.Tensor,   # x 方向流速
-        v: torch.Tensor,   # y 方向流速
-        C_tk: torch.Tensor,        # 总输沙浓度
-        beta_tk: torch.Tensor,     # 总输沙修正系数
-        epsilon_thk: torch.Tensor, # 扩散系数
-        E_tk: torch.Tensor,        # 侵蚀率（源）
-        D_tk: torch.Tensor,        # 沉积率（汇）
-    ) -> torch.Tensor:
-        """HEC-RAS 原文总输沙输移方程残差。
-
-        PDE:
-            ∂/∂t(h C_tk / β_tk) + ∇·(h U C_tk)
-            = ∇·(ε_thk h ∇C_tk) + E_tk - D_tk
-
-        残差 R_Ck = 储量项 + 对流项 - 扩散项 - 源 + 汇。
-        理想情况下 R_Ck = 0。
-        """
-        beta_safe = torch.clamp(beta_tk, min=EPS_DIVISION)   # 防止除以零
-
-        # ① 储量项：∂(h C_tk / β_tk) / ∂t
-        storage = h * C_tk / beta_safe
-        storage_t = SedimentPINN._dt(storage, xyt)
-
-        # ② 对流项：∂(h u C_tk)/∂x + ∂(h v C_tk)/∂y
-        adv_x = h * u * C_tk
-        adv_y = h * v * C_tk
-        advection = SedimentPINN._dx(adv_x, xyt) + SedimentPINN._dy(adv_y, xyt)
-
-        # ③ 扩散项：∂(ε h ∂C/∂x)/∂x + ∂(ε h ∂C/∂y)/∂y
-        diff_x = epsilon_thk * h * SedimentPINN._dx(C_tk, xyt)
-        diff_y = epsilon_thk * h * SedimentPINN._dy(C_tk, xyt)
-        diffusion = SedimentPINN._dx(diff_x, xyt) + SedimentPINN._dy(diff_y, xyt)
-
-        return storage_t + advection - diffusion - E_tk + D_tk
-
-    @staticmethod
-    def total_load_loss(
-        xyt, h, u, v, C_tk, beta_tk, epsilon_thk, E_tk, D_tk,
-    ) -> tuple:
-        """总输沙 PDE 损失：MSE(R_Ck)，返回 (标量损失, 残差张量)。"""
-        residual = SedimentPINN.total_load_residual(
-            xyt, h, u, v, C_tk, beta_tk, epsilon_thk, E_tk, D_tk
-        )
-        return torch.mean(residual ** 2), residual
-
-    @staticmethod
-    def grass_formula(u: torch.Tensor, v: torch.Tensor,
-                      Ag=0.001, m=3, eps=EPS_SAFE):
-        """Grass 简化输沙通量公式。
-
-        qx = Ag * u * |U|^(m-1)
-        qy = Ag * v * |U|^(m-1)
-
-        返回 (qx, qy, |U|)。
-        """
-        vel_mag = torch.sqrt(u ** 2 + v ** 2 + eps)
-        factor = Ag * torch.pow(vel_mag, m - 1)
-        qx = factor * u
-        qy = factor * v
-        return qx, qy, vel_mag
-
-
-class BedPINN(BasePINN):
-    """床面演变 PINN：输入 (x, y, t)，输出河床高程 z_b。
-
-    输出经 tanh 缩放至 [-zb_scale, +zb_scale]，代表绝对河床高程变化。
-    """
-
-    def __init__(self, input_dim=3, hidden_dim=64, num_block=4,
-                 output_dim=1, zb_scale=1.5):
-        super().__init__(input_dim, hidden_dim, num_block, output_dim)
-        self.zb_scale = zb_scale   # 河床高程物理范围上界 (m)
-
-    def forward(self, xyT: torch.Tensor) -> torch.Tensor:
-        x = self.input_layer(xyT)
-        for block in self.res_blocks:
-            x = block(x)
-        out = self.output_layer(x)
-        return torch.tanh(out) * self.zb_scale   # 绝对 zb ∈ [-1.5, +1.5] m
-
