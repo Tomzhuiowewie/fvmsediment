@@ -3,8 +3,6 @@
 #   FlowPINN      → 水深 h、流速 u, v
 #   SedimentPINN  → 总输沙浓度 C_tk
 #   BedPINN       → 河床高程 z_b
-#   GradationPINN → 床沙级配 p_k
-# 同时提供 CoupledFlowSedimentPINN 作为统一耦合容器。
 
 import torch
 import torch.nn as nn
@@ -87,6 +85,16 @@ class FlowPINN(BasePINN):
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4, output_dim=3):
         super().__init__(input_dim, hidden_dim, num_block, output_dim,
                          final_activation=nn.Sigmoid())
+
+    @staticmethod
+    def encode_target(
+        h: torch.Tensor, u: torch.Tensor, v: torch.Tensor,
+        typical_h: float, typical_u: float,
+    ) -> torch.Tensor:
+        h_norm = h / typical_h
+        u_norm = u / (2.0 * typical_u) + 0.5
+        v_norm = v / (2.0 * typical_u) + 0.5
+        return torch.cat([h_norm, u_norm, v_norm], dim=1)
 
     @staticmethod
     def decode_output(
@@ -247,122 +255,3 @@ class BedPINN(BasePINN):
         out = self.output_layer(x)
         return torch.tanh(out) * self.zb_scale   # 绝对 zb ∈ [-1.5, +1.5] m
 
-
-class GradationPINN(BasePINN):
-    """床沙级配 PINN：输入 (x, y, t)，输出各粒径级体积分数 p_k。
-
-    forward 使用 softmax，天然满足：
-        p_k ≥ 0,  Σ_k p_k = 1
-
-    类中还包含活动层厚度闭合、级配守恒残差等静态方法。
-    """
-
-    def __init__(self, input_dim=3, hidden_dim=64, num_block=4, output_dim=1):
-        super().__init__(input_dim, hidden_dim, num_block, output_dim)
-
-    def forward(self, xyt: torch.Tensor) -> torch.Tensor:
-        x = self.input_layer(xyt)
-        for block in self.res_blocks:
-            x = block(x)
-        raw_p = self.output_layer(x)
-        # softmax 保证每个空间点的粒径比例非负且和为 1
-        return torch.softmax(raw_p, dim=-1)
-
-    @staticmethod
-    def gradation_constraint(p_k: torch.Tensor) -> torch.Tensor:
-        """级配归一约束残差：Σ_k p_k - 1。理想值为 0。"""
-        return torch.sum(p_k, dim=1, keepdim=True) - 1.0
-
-    @staticmethod
-    def active_layer_thickness(d_k, p_k=None, alpha_a=1.0) -> torch.Tensor:
-        """活动层厚度 L_a 简化闭合。
-
-        若提供 p_k，则用级配加权平均粒径代表活动层尺度；
-        否则用最大粒径。
-        工程上也可替换为 L_a = alpha_a * D90。
-        """
-        if not torch.is_tensor(d_k):
-            like = p_k if p_k is not None else None
-            d_k = torch.as_tensor(d_k, dtype=like.dtype, device=like.device) \
-                if like is not None else torch.as_tensor(d_k)
-        if p_k is not None:
-            d_k = d_k.to(dtype=p_k.dtype, device=p_k.device).view(1, -1)
-            d_ref = torch.sum(p_k * d_k, dim=1, keepdim=True)
-        else:
-            d_ref = torch.max(d_k).view(1, 1)
-        return alpha_a * d_ref
-
-    @staticmethod
-    def active_layer_residual(xyt, p_k, L_a, E_k, D_k, rho_s=2650.0):
-        """活动层级配守恒残差。
-
-        简化形式：
-            R_pk = ∂(L_a p_k)/∂t - (D_k - E_k)/ρ_s
-                   + p_k * Σ_j((D_j - E_j)/ρ_s)
-
-        含义：某粒径级的活动层储量变化 = 该粒径级净沉积量，
-        并扣除总床面升降对各粒径比例的稀释/富集影响。
-        """
-        if not torch.is_tensor(rho_s):
-            rho_s = torch.as_tensor(rho_s, dtype=p_k.dtype, device=p_k.device)
-
-        exchange = (D_k - E_k) / (rho_s + EPS_DIVISION)  # 净沉积体积通量
-        total_exchange = torch.sum(exchange, dim=1, keepdim=True)
-        storage = L_a * p_k
-        storage_t = SedimentPINN._dt(storage, xyt)   # ∂(L_a p_k)/∂t
-
-        return storage_t - exchange + p_k * total_exchange
-
-    @staticmethod
-    def active_layer_loss(xyt, p_k, L_a, E_k, D_k,
-                          rho_s=2650.0, w_sum=1.0):
-        """活动层级配 PDE 损失：MSE(R_pk) + 归一约束。"""
-        residual = GradationPINN.active_layer_residual(
-            xyt, p_k, L_a, E_k, D_k, rho_s
-        )
-        sum_residual = GradationPINN.gradation_constraint(p_k)
-        loss = torch.mean(residual ** 2) + w_sum * torch.mean(sum_residual ** 2)
-        return loss, residual
-
-
-class CoupledFlowSedimentPINN(nn.Module):
-    """四网络耦合容器。
-
-    将 FlowPINN / SedimentPINN / BedPINN / GradationPINN
-    封装为一个模块，方便后续全耦合训练或联合推理。
-
-    目前训练流程仍采用解耦方式，此类仅提供统一入口。
-    """
-
-    def __init__(self, num_grain_classes=1, input_dim=3, hidden_dim=64,
-                 num_block=4, zb_scale=1.5):
-        super().__init__()
-        self.flow_net = FlowPINN(
-            input_dim=input_dim, hidden_dim=hidden_dim,
-            num_block=num_block, output_dim=3,
-        )
-        self.sediment_net = SedimentPINN(
-            input_dim=input_dim, hidden_dim=hidden_dim,
-            num_block=num_block, output_dim=num_grain_classes,
-        )
-        self.bed_net = BedPINN(
-            input_dim=input_dim, hidden_dim=hidden_dim,
-            num_block=num_block, output_dim=1, zb_scale=zb_scale,
-        )
-        self.gradation_net = GradationPINN(
-            input_dim=input_dim, hidden_dim=hidden_dim,
-            num_block=num_block, output_dim=num_grain_classes,
-        )
-
-    def forward(self, xyt: torch.Tensor) -> dict:
-        """一次前向得到全部物理量，以字典形式返回。"""
-        flow = self.flow_net(xyt)
-        return {
-            'flow': flow,
-            'h': flow[:, 0:1],       # 水深
-            'u': flow[:, 1:2],       # x 流速
-            'v': flow[:, 2:3],       # y 流速
-            'C_tk': self.sediment_net(xyt),
-            'zb': self.bed_net(xyt),
-            'p_k': self.gradation_net(xyt),
-        }

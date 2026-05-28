@@ -66,25 +66,6 @@ def match_closure(value, reference: torch.Tensor, default: float) -> torch.Tenso
     return value_tensor.expand_as(reference) if value_tensor.numel() == 1 else value_tensor
 
 
-def grain_diameters_like(grain_diameters, reference: torch.Tensor) -> torch.Tensor:
-    """返回粒径向量 d_k，形状与 reference 的第 1 维（粒径级数 K）对齐。
-
-    Args:
-        grain_diameters: None 或用列表/数组给出的各粒径级代表粒径。
-        reference: 用于推断 dtype/device/K 的参考张量。
-
-    Returns:
-        形状 [K] 的粒径张量。
-    """
-    k = reference.shape[1]
-    if grain_diameters is None:
-        return torch.ones(k, dtype=reference.dtype, device=reference.device) * 2e-4
-    d_k = torch.as_tensor(grain_diameters, dtype=reference.dtype, device=reference.device)
-    if d_k.numel() != k:
-        raise ValueError(f'grain_diameters length must be K={k}, got {d_k.numel()}.')
-    return d_k
-
-
 def smooth_positive(x: torch.Tensor, sharpness: float = 1e-3) -> torch.Tensor:
     """平滑正部函数，用 softplus 近似 max(x, 0)，在 x=0 处可导。
 

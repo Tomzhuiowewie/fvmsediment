@@ -32,6 +32,7 @@ class SimulationConfig:
     # 典型深度和速度，用于损失函数的物理量级调整
     typical_depth: float = 10.0
     typical_velocity: float = 1.0
+    include_flow_time_terms: bool = False
 
     # 颗粒直径和类别数量
     grain_diameters: List[float] = field(default_factory=lambda: [2e-4, 5e-4])
@@ -45,7 +46,6 @@ class SimulationConfig:
         'flow_lr': 1e-3,
         'sediment_lr': 1e-3,
         'transport_lr': 1e-3,
-        'gradation_lr': 1e-3,
         'warmup_ic_epochs': 800,
         'flow_epochs_per_step': 300,
         'sediment_epochs_per_step': 400,
@@ -56,9 +56,9 @@ class SimulationConfig:
     bc_default: Dict[str, float] = field(default_factory=lambda: {
         'n_bc': 50,
         't_normalized': 0.5,
-        'h_norm': 1.0,
-        'u_norm': 1.0,
-        'v_norm': 0.5,
+        'h': 10.0,
+        'u': 1.0,
+        'v': 0.0,
     })
 
     @property
@@ -76,6 +76,7 @@ N_GAUSS_POINTS = _default.n_gauss_points
 BOUNDS = _default.bounds
 TYPICAL_DEPTH = _default.typical_depth
 TYPICAL_VELOCITY = _default.typical_velocity
+INCLUDE_FLOW_TIME_TERMS = _default.include_flow_time_terms
 GRAIN_DIAMETERS = _default.grain_diameters
 NUM_GRAIN_CLASSES = _default.num_grain_classes
 AG_VALUES = _default.ag_values

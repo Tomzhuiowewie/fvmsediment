@@ -19,20 +19,30 @@ class FVMeshPreprocessor:
         self.resolution = resolution
         self.n_gauss_points = n_gauss_points
         self._generate_mesh()
-        self._initialize_bed(initial_bed)
-        self._setup_gauss_quadrature()
-        self._precompute_edge_data()
+        self._initialize_bed(initial_bed)   # 初始化床面高程数据，支持常数、函数或默认零值
+        self._setup_gauss_quadrature()  # 设置高斯积分点位置和权重
+        self._precompute_edge_data()    # 预计算边界积分相关数据
 
     def _generate_mesh(self):
         xmin, xmax = self.bbox['xmin'], self.bbox['xmax']
         ymin, ymax = self.bbox['ymin'], self.bbox['ymax']
-        self.nx = int((xmax - xmin) / self.resolution)
-        self.ny = int((ymax - ymin) / self.resolution)
-        x_centers = np.linspace(xmin + self.resolution / 2, xmax - self.resolution / 2, self.nx)
-        y_centers = np.linspace(ymin + self.resolution / 2, ymax - self.resolution / 2, self.ny)
+        x_length = xmax - xmin
+        y_length = ymax - ymin
+        self.nx = int(round(x_length / self.resolution))
+        self.ny = int(round(y_length / self.resolution))
+        if self.nx <= 0 or self.ny <= 0:
+            raise ValueError("bbox 尺寸必须大于 resolution。")
+        if not np.isclose(self.nx * self.resolution, x_length):
+            raise ValueError("x 方向 bbox 长度必须能被 resolution 整除。")
+        if not np.isclose(self.ny * self.resolution, y_length):
+            raise ValueError("y 方向 bbox 长度必须能被 resolution 整除。")
+        x_centers = xmin + (np.arange(self.nx) + 0.5) * self.resolution
+        y_centers = ymin + (np.arange(self.ny) + 0.5) * self.resolution
+        # 生成网格格心坐标，并展平为一维数组，方便后续计算和存储
         self.cell_centers_x, self.cell_centers_y = np.meshgrid(x_centers, y_centers)
         self.cell_centers_x = self.cell_centers_x.flatten()
         self.cell_centers_y = self.cell_centers_y.flatten()
+        
         self.n_cells = len(self.cell_centers_x)
         self.cell_area = self.resolution ** 2
         self.cell_index = np.arange(self.n_cells).reshape(self.ny, self.nx)
@@ -291,4 +301,3 @@ if __name__ == "__main__":
     print(processor.bed_template)
     print(processor.bed_gradation)
     print(processor.gradation_layers)
-
