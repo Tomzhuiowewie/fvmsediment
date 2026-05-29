@@ -7,8 +7,8 @@
 import torch
 
 from .config import EPS_DIVISION, EPS_SAFE, EPS_VELOCITY_CLAMP
-from .losses import build_xyt, match_closure, smooth_positive
 from .model import FlowPINN, SedimentPINN
+from .utils import build_xyt, match_closure, smooth_positive, time_derivative
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -64,20 +64,20 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
 
     def __init__(self, fvm_mesh, g=9.81, n_manning=0.01, bounds=None,
                  typical_depth=10.0, typical_velocity=1.0,
-                 T_physical=1.0, include_time_terms=True, eps=EPS_SAFE):
+                 simulation_time=1.0, include_time_terms=True, eps=EPS_SAFE):
         self.mesh = fvm_mesh
         self.g = g
         self.n = n_manning
         self.bounds = bounds
         self.typical_h = typical_depth
         self.typical_u = typical_velocity
-        self.T_physical = T_physical
+        self.simulation_time = simulation_time
         self.include_time_terms = include_time_terms
         self.eps = eps
         self.residual_scale = 1.0 / (fvm_mesh.cell_area * typical_depth * typical_velocity)
         self._init_cache(fvm_mesh)
 
-    def compute_loss(self, model, t, device, zb_tensor=None):
+    def compute_loss(self, model, t, device):
         """计算 SVEs 物理损失。
 
         返回:
@@ -89,7 +89,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         gauss_normals = self._gauss_normals_t
         gauss_weights = self._gauss_weights_t
 
-        # ── 构建输入并前向推理 ──
+        # 构建输入并前向推理
         xyt = build_xyt(
             gauss_coords, t, self.bounds, device,
             requires_grad=self.include_time_terms,
@@ -97,21 +97,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         outputs = model(xyt)
         h, u, v = FlowPINN.decode_output(outputs, self.typical_h, self.typical_u)
 
-        def dt(q):
-            if not self.include_time_terms:
-                return torch.zeros_like(q)
-            grad = torch.autograd.grad(
-                q, xyt,
-                grad_outputs=torch.ones_like(q),
-                create_graph=True,
-                retain_graph=True,
-                allow_unused=True,
-            )[0]
-            if grad is None:
-                return torch.zeros_like(q)
-            return grad[:, 2:3] / max(self.T_physical, EPS_DIVISION)
-
-        # ── 几何量准备 ──
+        # 几何量准备
         nx = gauss_normals[:, 0:1]  # x方向法向量分量，形状 [N, 1]
         ny = gauss_normals[:, 1:2]  # y方向法向量分量
         Nc = self.mesh.n_cells
@@ -123,20 +109,24 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         v_r = v.view(Nc, npp)
         h_cell = torch.mean(h_r, dim=1, keepdim=True)   # 单元平均水深
 
-        # ── ① 连续性方程：∂/∂t∫h dA + ∮ (hu·nx + hv·ny) dS = 0 ──
-        h_t_cell = torch.mean(dt(h).view(Nc, npp), dim=1, keepdim=True)
+        # ① 连续性方程：∂/∂t∫h dA + ∮ (hu·nx + hv·ny) dS = 0
+        h_t_cell = torch.mean(
+            time_derivative(h, xyt, self.simulation_time, self.include_time_terms).view(Nc, npp),
+            dim=1,
+            keepdim=True,
+        )
         vol_h = h_t_cell * self.mesh.cell_area
         flux_h = (h * u) * nx + (h * v) * ny
         bnd_h = torch.sum(flux_h.view(Nc, npp) * weights_r, dim=1, keepdim=True)
         cont_res = (vol_h + bnd_h) * self.residual_scale
         loss_continuity = torch.mean(cont_res ** 2)
 
-        # ── ② 床面坡度源项：S = -g·h·∇zb·A ──
-        dzb_dx_t, dzb_dy_t = self.mesh.get_bed_gradient_tensor(zb_tensor, device)
+        # ② 床面坡度源项：S = -g·h·∇zb·A
+        dzb_dx_t, dzb_dy_t = self.mesh.get_bed_gradient(device)
         slope_x = -self.g * h_cell * dzb_dx_t.unsqueeze(1) * self.mesh.cell_area
         slope_y = -self.g * h_cell * dzb_dy_t.unsqueeze(1) * self.mesh.cell_area
 
-        # ── ③ Manning 摩擦项：τ = g·n²·|U|·u / h^(1/3) ──
+        # ③ Manning 摩擦项：τ = g·n²·|U|·u / h^(1/3)
         h_safe = torch.clamp(h_r, min=0.05)
         vel_mag = torch.sqrt(u_r ** 2 + v_r ** 2 + self.eps)
         fric_tx = torch.mean(
@@ -148,18 +138,26 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
             dim=1, keepdim=True
         ) * self.mesh.cell_area
 
-        # ── ④ x 方向动量方程 ──
+        # ④ x 方向动量方程
         flux_mx = (h * u * u + 0.5 * self.g * h * h) * nx + (h * u * v) * ny
         bnd_mx = torch.sum(flux_mx.view(Nc, npp) * weights_r, dim=1, keepdim=True)
-        hu_t_cell = torch.mean(dt(h * u).view(Nc, npp), dim=1, keepdim=True)
+        hu_t_cell = torch.mean(
+            time_derivative(h * u, xyt, self.simulation_time, self.include_time_terms).view(Nc, npp),
+            dim=1,
+            keepdim=True,
+        )
         vol_mx = hu_t_cell * self.mesh.cell_area
         mom_x_res = (vol_mx + bnd_mx - slope_x + fric_tx) * self.residual_scale
         loss_momentum_x = torch.mean(mom_x_res ** 2)
 
-        # ── ⑤ y 方向动量方程 ──
+        # ⑤ y 方向动量方程
         flux_my = (h * v * u) * nx + (h * v * v + 0.5 * self.g * h * h) * ny
         bnd_my = torch.sum(flux_my.view(Nc, npp) * weights_r, dim=1, keepdim=True)
-        hv_t_cell = torch.mean(dt(h * v).view(Nc, npp), dim=1, keepdim=True)
+        hv_t_cell = torch.mean(
+            time_derivative(h * v, xyt, self.simulation_time, self.include_time_terms).view(Nc, npp),
+            dim=1,
+            keepdim=True,
+        )
         vol_my = hv_t_cell * self.mesh.cell_area
         mom_y_res = (vol_my + bnd_my - slope_y + fric_ty) * self.residual_scale
         loss_momentum_y = torch.mean(mom_y_res ** 2)
@@ -180,8 +178,6 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
 
 class SedimentTransportLoss(_CachedMeshTensors):
     """总输沙输移方程损失。
-
-    负责计算：
     - 总输沙浓度 C_tk 的有限体积对流扩散残差
     - 输沙容量闭合损失（C_tk 趋近平衡浓度 C_capacity）
 
@@ -212,11 +208,11 @@ class SedimentTransportLoss(_CachedMeshTensors):
         m=3,
         adaptation_length=50.0,
         rho_s=2650.0,
-        T_physical=1.0,
+        simulation_time=1.0,
         include_time_terms=True,
         alpha_active_layer=10.0,
         w_capacity=0.05,
-        source_sharpness=EPS_VELOCITY_CLAMP,    # 用于 smooth_positive 的侵蚀/沉积分离锐度，越大越接近硬分段函数，但可能导致数值不稳定
+        source_sharpness=EPS_VELOCITY_CLAMP,
     ):
         self.mesh = fvm_mesh
         self.bounds = bounds
@@ -230,7 +226,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
         self.m = m
         self.adaptation_length = adaptation_length
         self.rho_s = rho_s
-        self.T_physical = T_physical
+        self.simulation_time = simulation_time
         self.include_time_terms = include_time_terms
         self.alpha_active_layer = alpha_active_layer
         self.w_capacity = w_capacity
@@ -259,24 +255,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
 
     def _dt(self, q, xyt):
         """Return physical-time derivative from normalized network time."""
-        if not self.include_time_terms:
-            return torch.zeros_like(q if q.dim() > 1 else q.unsqueeze(1))
-
-        def dt_one(q_one):
-            grad = torch.autograd.grad(
-                q_one, xyt,
-                grad_outputs=torch.ones_like(q_one),
-                create_graph=True,
-                retain_graph=True,
-                allow_unused=True,
-            )[0]
-            if grad is None:
-                return torch.zeros_like(q_one)
-            return grad[:, 2:3] / max(self.T_physical, EPS_DIVISION)
-
-        if q.dim() == 1 or q.shape[1] == 1:
-            return dt_one(q if q.dim() > 1 else q.unsqueeze(1))
-        return torch.cat([dt_one(q[:, k:k + 1]) for k in range(q.shape[1])], dim=1)
+        return time_derivative(q, xyt, self.simulation_time, self.include_time_terms)
 
     def _physical_grad(self, q, xyt, dim):
         """Return physical-space derivative for x(dim=0) or y(dim=1)."""
@@ -327,7 +306,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
         loss = torch.mean((residual * self.residual_scale) ** 2)
         return loss, residual
 
-    # ── 统一闭合计算 ──
+    # 统一闭合计算
 
     def compute_closure(
         self,
@@ -335,11 +314,6 @@ class SedimentTransportLoss(_CachedMeshTensors):
         flow_model,
         T_norm,
         device,
-        gradation_model=None,
-        beta_tk=None,
-        epsilon_thk=None,
-        E_tk=None,
-        D_tk=None,
         p_k_override=None,
         freeze_flow_params=True,
     ):
@@ -370,22 +344,13 @@ class SedimentTransportLoss(_CachedMeshTensors):
         if p_k_override is not None:
             p_k = match_closure(p_k_override, C_tk, 1.0 / C_tk.shape[1])
         else:
-            p_k = (torch.ones_like(C_tk) / C_tk.shape[1]
-                   if gradation_model is None else gradation_model(xyt))
+            p_k = torch.ones_like(C_tk) / C_tk.shape[1]
 
         # 闭合参数整理
-        beta_tk = match_closure(beta_tk, C_tk, self.beta_default)
-        epsilon_thk = match_closure(epsilon_thk, C_tk, self.epsilon_default)
+        beta_tk = torch.ones_like(C_tk) * self.beta_default
+        epsilon_thk = torch.ones_like(C_tk) * self.epsilon_default
 
-        if E_tk is None or D_tk is None:
-            C_capacity, E_closure, D_closure, vel_mag = self._capacity_closure(h, u, v, C_tk, p_k)
-            E_tk = E_closure if E_tk is None else match_closure(E_tk, C_tk, 0.0)
-            D_tk = D_closure if D_tk is None else match_closure(D_tk, C_tk, 0.0)
-        else:
-            C_capacity = C_tk.detach()
-            vel_mag = torch.sqrt(u ** 2 + v ** 2 + EPS_DIVISION)
-            E_tk = match_closure(E_tk, C_tk, 0.0)
-            D_tk = match_closure(D_tk, C_tk, 0.0)
+        C_capacity, E_tk, D_tk, vel_mag = self._capacity_closure(h, u, v, C_tk, p_k)
 
         return {
             'xyt': xyt, 'h': h, 'u': u, 'v': v,
@@ -395,60 +360,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
             'C_capacity': C_capacity, 'vel_mag': vel_mag,
         }
 
-    # ── 联合损失（输沙 + 级配）──
-
-    def compute_loss(
-        self,
-        sediment_model,
-        flow_model,
-        T_norm,
-        device,
-        gradation_model=None,
-        beta_tk=None,
-        epsilon_thk=None,
-        E_tk=None,
-        D_tk=None,
-        p_k_override=None,
-        freeze_flow_params=True,
-    ):
-        """联合损失 = 输沙 PDE 残差 + 容量损失 + 级配损失。"""
-        closure = self.compute_closure(
-            sediment_model, flow_model, T_norm, device,
-            gradation_model=gradation_model, beta_tk=beta_tk,
-            epsilon_thk=epsilon_thk, E_tk=E_tk, D_tk=D_tk,
-            p_k_override=p_k_override,
-            freeze_flow_params=freeze_flow_params,
-        )
-        xyt     = closure['xyt']
-        h, u, v = closure['h'], closure['u'], closure['v']
-        C_tk    = closure['C_tk']
-        E_tk    = closure['E_tk']
-        D_tk    = closure['D_tk']
-        C_capacity = closure['C_capacity']
-        vel_mag    = closure['vel_mag']
-
-        # 输沙 PDE 有限体积残差
-        transport_loss, residual = self.total_load_fvm_loss(
-            xyt, h, u, v, C_tk,
-            closure['beta_tk'], closure['epsilon_thk'], E_tk, D_tk,
-        )
-        capacity_loss = torch.mean((C_tk - C_capacity.detach()) ** 2)
-
-        loss = transport_loss + self.w_capacity * capacity_loss
-        return loss, {
-            'transport': transport_loss.item(),
-            'capacity': capacity_loss.item(),
-            'total': loss.item(),
-            'residual_mean': torch.mean(torch.abs(residual)).item(),
-            'C_min': torch.min(C_tk).item(),
-            'C_max': torch.max(C_tk).item(),
-            'Ceq_mean': torch.mean(C_capacity).item(),
-            'p_min': torch.min(p_k).item(),
-            'p_max': torch.max(p_k).item(),
-            'U_mean': torch.mean(vel_mag).item(),
-        }
-
-    # ── 仅输沙损失（独立更新 sediment_model）──
+    # 仅输沙损失（独立更新 sediment_model）──
 
     def compute_sediment_loss(
         self,
@@ -456,17 +368,13 @@ class SedimentTransportLoss(_CachedMeshTensors):
         flow_model,
         T_norm,
         device,
-        gradation_model=None,
-        beta_tk=None,
-        epsilon_thk=None,
         p_k_override=None,
     ):
         """仅计算输沙 PDE 残差 + 容量损失，用于独立更新 sediment_model。"""
         closure = self.compute_closure(
             sediment_model, flow_model, T_norm, device,
-            gradation_model=gradation_model, beta_tk=beta_tk,
             p_k_override=p_k_override,
-            epsilon_thk=epsilon_thk, freeze_flow_params=True,
+            freeze_flow_params=True,
         )
         xyt     = closure['xyt']
         h, u, v = closure['h'], closure['u'], closure['v']

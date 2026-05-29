@@ -1,90 +1,72 @@
-# config.py – 模拟配置
-# 提供 SimulationConfig dataclass 和统一的数值常量。
-# 支持通过实例化不同 SimulationConfig 切换实验参数，
-# 同时保留模块级常量作为默认配置的快捷访问。
+# config.py - YAML 配置读取
 
-from dataclasses import dataclass, field
-from typing import Dict, List
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List
 
-import torch
+import yaml
 
 
-# ── 统一数值 epsilon 常量 ──
-EPS_SAFE = 1e-6           # 通用安全下限（平方根、除法分母等）
-EPS_DIVISION = 1e-8       # 严格防零除（rho_s、beta_tk 等）
-EPS_VELOCITY_CLAMP = 1e-3 # 流速下限截断（适应长度计算）
+# epsilon 常量
+EPS_SAFE = 1e-6
+EPS_DIVISION = 1e-8
+EPS_VELOCITY_CLAMP = 1e-3
 
 
 @dataclass
 class SimulationConfig:
-    device: torch.device = field(default_factory=lambda: torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-
-    # 域边界和分辨率
-    bbox: Dict[str, float] = field(default_factory=lambda: {'xmin': 0.0, 'xmax': 1000.0, 'ymin': 0.0, 'ymax': 1000.0})
-    resolution: float = 25.0
-
-    # 每条边高斯积分点数量
-    n_gauss_points: int = 2
-
-    # 坐标归一化边界
-    bounds: Dict[str, float] = field(default_factory=lambda: {'x_min': 0.0, 'x_max': 1000.0, 'y_min': 0.0, 'y_max': 1000.0})
-
-    # 典型深度和速度，用于损失函数的物理量级调整
-    typical_depth: float = 10.0
-    typical_velocity: float = 1.0
-    # 统一控制水动力和输沙方程的时间项；False 表示准稳态。
-    include_time_terms: bool = False
-
-    # 颗粒直径和类别数量
-    grain_diameters: List[float] = field(default_factory=lambda: [2e-4, 5e-4])
-
-    # 不同演化速率对应的 A_g 值和物理时间长度
-    ag_values: Dict[str, float] = field(default_factory=lambda: {'slow': 0.001, 'fast': 1.0})
-    t_physical: Dict[str, float] = field(default_factory=lambda: {'slow': 360000.0, 'fast': 600.0})
-
-    # 训练设置
-    training: Dict[str, float] = field(default_factory=lambda: {
-        'flow_lr': 1e-3,
-        'transport_lr': 1e-3,
-        'flow_epochs_per_step': 300,
-        'sediment_epochs_per_step': 400,
-        'extra_train_chunk': 100,
-        'max_extra_flow_epochs': 600,
-        'max_extra_sediment_epochs': 800,
-        'flow_loss_tol': 1e-4,
-        'sediment_loss_tol': 1e-4,
-        'max_bed_change_per_step': 0.02,
-        'n_macro_steps': 200,
-    })
-
-    # 边界条件默认设置
-    bc_default: Dict[str, float] = field(default_factory=lambda: {
-        'n_bc': 50,
-        't_normalized': 0.5,
-        'h': 10.0,
-        'u': 1.0,
-        'v': 0.0,
-    })
+    bounds: Dict[str, float]
+    bbox: Dict[str, float]
+    resolution: float
+    n_gauss_points: int
+    include_time_terms: bool
+    simulation_time: float
+    n_windows: int
+    sample_dt: float
+    window_dt: float
+    output_dt: float
+    typical_depth: float
+    typical_velocity: float
+    ag: float
+    grain_diameters: List[float]
+    bc_default: Dict[str, Any]
+    training: Dict[str, Any]
 
     @property
     def num_grain_classes(self) -> int:
         return len(self.grain_diameters)
 
 
-# ── 向后兼容的模块级别名 ──
-_default = SimulationConfig()
+def load_config(path) -> SimulationConfig:
+    yaml_path = Path(path)
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {yaml_path}")
+    with yaml_path.open('r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError("配置文件必须是 YAML 字典结构。")
 
-DEVICE = _default.device
-BBOX = _default.bbox
-RESOLUTION = _default.resolution
-N_GAUSS_POINTS = _default.n_gauss_points
-BOUNDS = _default.bounds
-TYPICAL_DEPTH = _default.typical_depth
-TYPICAL_VELOCITY = _default.typical_velocity
-INCLUDE_TIME_TERMS = _default.include_time_terms
-GRAIN_DIAMETERS = _default.grain_diameters
-NUM_GRAIN_CLASSES = _default.num_grain_classes
-AG_VALUES = _default.ag_values
-TPHYSICAL = _default.t_physical
-TRAINING_SETTINGS = _default.training
-BC_DEFAULT = _default.bc_default
+    domain = data['domain']
+    fvm = data['fvm']
+    physics = data['physics']
+    boundary = data['boundary']
+    training = data['training']
+
+    return SimulationConfig(
+        bounds=domain['bounds'],
+        bbox=domain['bbox'],
+        resolution=float(domain['resolution']),
+        n_gauss_points=int(fvm['n_gauss_points']),
+        include_time_terms=bool(physics['include_time_terms']),
+        simulation_time=float(physics['simulation_time']),
+        n_windows=int(physics['n_windows']),
+        sample_dt=float(physics['sample_dt']),
+        window_dt=float(physics['window_dt']),
+        output_dt=float(physics['output_dt']),
+        typical_depth=float(physics['flow']['typical_depth']),
+        typical_velocity=float(physics['flow']['typical_velocity']),
+        ag=float(physics['sediment']['ag']),
+        grain_diameters=list(physics['sediment']['grain_diameters']),
+        bc_default=dict(boundary),
+        training=dict(training),
+    )

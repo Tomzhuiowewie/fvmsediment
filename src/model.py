@@ -9,10 +9,8 @@ import torch.nn.functional as F
 
 
 class ResBlock(nn.Module):
-    """残差块：两个全连接层 + Tanh 激活 + 跳跃连接。
-
-    跳跃连接有助于缓解深层 PINN 中的梯度消失问题，
-    让网络更容易学习 PDE 的复杂解。
+    """
+    残差块：两个全连接层 + Tanh 激活 + 跳跃连接。
     """
     def __init__(self, hidden_dim: int):
         super().__init__()
@@ -28,11 +26,9 @@ class ResBlock(nn.Module):
 
 
 class BasePINN(nn.Module):
-    """PINN 网络基类，封装公共的前向结构与 Xavier 初始化。
-
-    结构：输入层 → N 个 ResBlock → 输出层（含可选的最终激活函数）。
-    Flow/Sediment 子网络均继承此类，
-    只需定制输出维度和最终激活即可。
+    """
+    PINN 网络基类，封装公共的前向结构与 Xavier 初始化。
+    结构：输入层 → N 个 ResBlock → 输出层。
     """
 
     def __init__(
@@ -72,12 +68,9 @@ class BasePINN(nn.Module):
 
 
 class FlowPINN(BasePINN):
-    """水动力 PINN：输入 (x, y, t)，输出归一化的 (h, u, v)。
-
-    输出经过 Sigmoid 约束到 [0, 1]，再由 decode_output 反归一化到物理量：
-        h = h_norm * typical_h
-        u = (u_norm - 0.5) * 2 * typical_u
-        v = (v_norm - 0.5) * 2 * typical_u
+    """
+    水动力 PINN：输入 (x, y, t)，输出归一化的 (h, u, v)。
+    输出通过 Sigmoid 激活限制在 (0, 1)，并在 encode/decode 中进行物理量的归一化和反归一化。
     """
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4, output_dim=3):
         super().__init__(input_dim, hidden_dim, num_block, output_dim,
@@ -104,13 +97,12 @@ class FlowPINN(BasePINN):
 
 
 class SedimentPINN(BasePINN):
-    """总输沙输移 PINN：输入 (x, y, t)，输出各粒径级总输沙浓度 C_tk。
-
-    正向输出通过 softplus 保证 C_tk ≥ 0。
+    """
+    总输沙输移 PINN：输入 (x, y, t)，输出各粒径级总输沙浓度 C_tk
     """
 
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4,
-                 output_dim=1, positive_output=True, **kwargs):
+                 output_dim=1, positive_output=True):
         self.positive_output = positive_output
         super().__init__(input_dim, hidden_dim, num_block, output_dim)
 

@@ -1,16 +1,76 @@
-# data.py – 地形与网格数据预处理
-# 包含：
-#   FVMeshPreprocessor    → FVM 结构化网格生成、高斯积分点预计算、床面梯度
-#   DemPreprocessor       → DEM GeoTIFF 读取与局部坐标转换
-#   SedimentDataProcessor → 河床粒径级配数据解析
-
-import importlib
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
-from scipy import ndimage
+
+from .model import FlowPINN
+
+
+def hump_initial_bed(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """hump 算例初始床面：在 [500,700]×[400,600] 区域生成正弦形凸起。"""
+    in_hump = ((x >= 500) & (x <= 700) & (y >= 400) & (y <= 600))
+    zb = np.zeros_like(x)
+    zb[in_hump] = (
+        np.sin(np.pi * (x[in_hump] - 500) / 200) ** 2
+        * np.sin(np.pi * (y[in_hump] - 400) / 200) ** 2
+    )
+    return zb
+
+
+def build_boundary_conditions(
+    t_norm,
+    bbox,
+    bounds,
+    bc_default,
+    typical_depth,
+    typical_velocity,
+    n_bc=None,
+):
+    if n_bc is None:
+        n_bc = int(bc_default['n_bc'])
+
+    h_bc = bc_default['h']
+    u_bc = bc_default['u']
+    v_bc = bc_default['v']
+    bc_value = FlowPINN.encode_target(
+        torch.tensor([[h_bc]], dtype=torch.float32),
+        torch.tensor([[u_bc]], dtype=torch.float32),
+        torch.tensor([[v_bc]], dtype=torch.float32),
+        typical_depth,
+        typical_velocity,
+    ).numpy().astype(np.float32)
+
+    x_min = bbox['xmin']
+    x_max = bbox['xmax']
+    y_min = bbox['ymin']
+    y_max = bbox['ymax']
+    x_scale = bounds['x_max'] - bounds['x_min']
+    y_scale = bounds['y_max'] - bounds['y_min']
+    if x_scale == 0 or y_scale == 0:
+        raise ValueError("bounds 的 x/y 范围不能为 0。")
+
+    x_left_norm = (x_min - bounds['x_min']) / x_scale
+    y_bottom_norm = (y_min - bounds['y_min']) / y_scale
+    y_top_norm = (y_max - bounds['y_min']) / y_scale
+
+    # 入口边界条件：在 x=x_min 处，h, u, v 都有约束
+    y_inlet = np.linspace(y_min, y_max, n_bc)
+    y_inlet_norm = (y_inlet - bounds['y_min']) / y_scale
+    coords_inlet = np.stack([np.full(n_bc, x_left_norm), y_inlet_norm, np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
+    values_inlet = np.repeat(bc_value, n_bc, axis=0)
+    mask_inlet = np.array([[1.0, 1.0, 1.0]] * n_bc, dtype=np.float32)   # 入口边界条件：h, u, v 都有约束
+
+    # 壁面边界条件：在 y=y_min 和 y=y_max 处，只有 v 有约束（无穿透），h 和 u 沿壁面自由变化
+    x_wall = np.linspace(x_min, x_max, n_bc)
+    x_wall_norm = (x_wall - bounds['x_min']) / x_scale
+    coords_wall_bot = np.stack([x_wall_norm, np.full(n_bc, y_bottom_norm), np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
+    coords_wall_top = np.stack([x_wall_norm, np.full(n_bc, y_top_norm), np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
+    values_wall = np.repeat(bc_value, n_bc, axis=0)
+    mask_wall = np.array([[0.0, 0.0, 1.0]] * n_bc, dtype=np.float32)
+
+    bc_coords = np.concatenate([coords_inlet, coords_wall_bot, coords_wall_top], axis=0)
+    bc_values = np.concatenate([values_inlet, values_wall, values_wall], axis=0)
+    bc_mask = np.concatenate([mask_inlet, mask_wall, mask_wall], axis=0)
+    return bc_coords, bc_values, bc_mask
 
 
 class FVMeshPreprocessor:
@@ -19,7 +79,7 @@ class FVMeshPreprocessor:
         self.resolution = resolution
         self.n_gauss_points = n_gauss_points
         self._generate_mesh()
-        self._initialize_bed(initial_bed)   # 初始化床面高程数据，支持常数、函数或默认零值
+        self._initialize_bed(initial_bed)   # 初始化床面高程数据
         self._setup_gauss_quadrature()  # 设置高斯积分点位置和权重
         self._precompute_edge_data()    # 预计算边界积分相关数据
 
@@ -28,21 +88,21 @@ class FVMeshPreprocessor:
         ymin, ymax = self.bbox['ymin'], self.bbox['ymax']
         x_length = xmax - xmin
         y_length = ymax - ymin
+        
+        # 网格数量
         self.nx = int(round(x_length / self.resolution))
         self.ny = int(round(y_length / self.resolution))
-        if self.nx <= 0 or self.ny <= 0:
-            raise ValueError("bbox 尺寸必须大于 resolution。")
-        if not np.isclose(self.nx * self.resolution, x_length):
-            raise ValueError("x 方向 bbox 长度必须能被 resolution 整除。")
-        if not np.isclose(self.ny * self.resolution, y_length):
-            raise ValueError("y 方向 bbox 长度必须能被 resolution 整除。")
+        
+        # 格心坐标
         x_centers = xmin + (np.arange(self.nx) + 0.5) * self.resolution
         y_centers = ymin + (np.arange(self.ny) + 0.5) * self.resolution
-        # 生成网格格心坐标，并展平为一维数组，方便后续计算和存储
+        
+        # 生成网格格心坐标，并展平为一维数组
         self.cell_centers_x, self.cell_centers_y = np.meshgrid(x_centers, y_centers)
         self.cell_centers_x = self.cell_centers_x.flatten()
         self.cell_centers_y = self.cell_centers_y.flatten()
         
+        # 网格总单元数和单元面积
         self.n_cells = len(self.cell_centers_x)
         self.cell_area = self.resolution ** 2
         self.cell_index = np.arange(self.n_cells).reshape(self.ny, self.nx)
@@ -106,10 +166,7 @@ class FVMeshPreprocessor:
     def update_bed(self, new_zb):
         self.zb = np.clip(np.array(new_zb), -5.0, 5.0)
 
-    def get_bed_at_gauss_points(self):
-        return self.zb[self.gauss_cell_id]
-
-    def get_bed_gradient(self):
+    def get_bed_gradient(self,device):
         zb_2d = self.zb.reshape(self.ny, self.nx)
         dzb_dx = np.zeros_like(zb_2d)
         dzb_dy = np.zeros_like(zb_2d)
@@ -126,178 +183,7 @@ class FVMeshPreprocessor:
             dzb_dy[0, :] = (zb_2d[1, :] - zb_2d[0, :]) / self.resolution
             dzb_dy[-1, :] = (zb_2d[-1, :] - zb_2d[-2, :]) / self.resolution
 
-        return dzb_dx.flatten(), dzb_dy.flatten()
-
-    def get_bed_gradient_tensor(self, zb_tensor, device):
-        """统一的床面梯度计算，支持 NumPy (zb_tensor=None) 和 PyTorch 张量两种输入。"""
-        if zb_tensor is None:
-            dzb_dx, dzb_dy = self.get_bed_gradient()
-            return (torch.tensor(dzb_dx, dtype=torch.float32, device=device),
-                    torch.tensor(dzb_dy, dtype=torch.float32, device=device))
-
-        zb = zb_tensor.to(dtype=torch.float32, device=device).reshape(self.ny, self.nx)
-        dzb_dx = torch.zeros_like(zb)
-        dzb_dy = torch.zeros_like(zb)
-        if self.nx > 1:
-            if self.nx > 2:
-                dzb_dx[:, 1:-1] = (zb[:, 2:] - zb[:, :-2]) / (2 * self.resolution)
-            dzb_dx[:, 0] = (zb[:, 1] - zb[:, 0]) / self.resolution
-            dzb_dx[:, -1] = (zb[:, -1] - zb[:, -2]) / self.resolution
-        if self.ny > 1:
-            if self.ny > 2:
-                dzb_dy[1:-1, :] = (zb[2:, :] - zb[:-2, :]) / (2 * self.resolution)
-            dzb_dy[0, :] = (zb[1, :] - zb[0, :]) / self.resolution
-            dzb_dy[-1, :] = (zb[-1, :] - zb[-2, :]) / self.resolution
-        return dzb_dx.flatten(), dzb_dy.flatten()
-
-# 英尺到米的转换系数
-US_SURVEY_FOOT_TO_METER = 0.3048006096012192
-
-class DemPreprocessor:
-    """读取 DEM GeoTIFF，并转换为局部米制坐标和高程。"""
-
-    def __init__(
-        self,
-        tif_path,
-        elevation_to_meter=US_SURVEY_FOOT_TO_METER,
-        mark_river_region=True,
-        river_elevation_max_m=None,
-        river_elevation_min_m=None,
-        river_seed_index=None,
-        river_seed_point_m=None,
-    ):
-        """初始化 DEM 数据，并可按高程阈值和种子点标记河道区域。"""
-        rasterio = importlib.import_module("rasterio")
-        tif_path = Path(tif_path)
-
-        with rasterio.open(tif_path) as src:
-            dem = src.read(1).astype("float32")
-            transform = src.transform
-            nodata = src.nodata
-            dem = np.where(dem == nodata, np.nan, dem)
-            coordinate_to_meter = float(src.crs.linear_units_factor[-1]) if src.crs else elevation_to_meter
-            
-        rows, cols = np.indices(dem.shape, dtype="float64")  # 获取 DEM 网格索引
-        x_raw, y_raw = transform * (cols + 0.5, rows + 0.5)  # 获取 DEM 网格格心坐标
-
-        # 转换为米制坐标和高程，并以最小坐标作为局部原点，方便后续计算和可视化
-        x_grid_m = np.asarray(x_raw, dtype="float64") * coordinate_to_meter
-        y_grid_m = np.asarray(y_raw, dtype="float64") * coordinate_to_meter
-        elevation_m = dem.astype("float64") * elevation_to_meter
-
-        x_origin_m = np.nanmin(x_grid_m)  # 获取 x 坐标最小值作为局部坐标原点
-        y_origin_m = np.nanmin(y_grid_m)  # 获取 y 坐标最小值作为局部坐标原点
-
-        # 存储为实例属性
-        self.x_grid_m = x_grid_m - x_origin_m  # 相对坐标网格，单位 m
-        self.y_grid_m = y_grid_m - y_origin_m  # 相对坐标网格，单位 m
-        self.elevation_m = elevation_m         # 高程网格，单位 m
-        self.x_origin_m = x_origin_m           # 原始 x 坐标原点，单位 m
-        self.y_origin_m = y_origin_m           # 原始 y 坐标原点，单位 m
-        self.river_region_mask = self._build_river_region_mask(
-            mark_river_region,
-            river_elevation_min_m,
-            river_elevation_max_m,
-            river_seed_index,
-            river_seed_point_m,
+        return (
+            torch.tensor(dzb_dx.flatten(), dtype=torch.float32, device=device),
+            torch.tensor(dzb_dy.flatten(), dtype=torch.float32, device=device),
         )
-
-    def _build_river_region_mask(
-        self,
-        mark_river_region,
-        river_elevation_min_m,
-        river_elevation_max_m,
-        river_seed_index,
-        river_seed_point_m,
-    ):
-        """按高程范围生成掩膜，并只保留种子点所在连通域。"""
-        if not mark_river_region:
-            return None
-
-        mask = np.isfinite(self.elevation_m)
-        if river_elevation_min_m is not None:
-            mask &= self.elevation_m >= river_elevation_min_m
-        if river_elevation_max_m is not None:
-            mask &= self.elevation_m <= river_elevation_max_m
-
-        # 连通域构建
-        labels, num_features = ndimage.label(mask)
-        if num_features == 0:
-            return mask
-
-        seed_index = self._resolve_river_seed_index(river_seed_index, river_seed_point_m)
-        if seed_index is None:
-            # 未指定种子点时，退回到最大连通域，避免返回多个碎片区域。
-            component_sizes = np.bincount(labels.ravel())   # 二维数据→一维标签计数，统计每个编号出现次数
-            component_sizes[0] = 0  # 标签0是背景，计数置零
-            return labels == component_sizes.argmax()
-
-        seed_row, seed_col = seed_index
-        seed_label = labels[seed_row, seed_col]
-        if seed_label == 0:
-            raise ValueError("河道种子点不在高程阈值筛选出的区域内，请调整种子点或高程阈值。")
-
-        return labels == seed_label
-
-    def _resolve_river_seed_index(self, river_seed_index, river_seed_point_m):
-        """把用户给定的种子点转换为 DEM 行列索引。"""
-        if river_seed_index is not None and river_seed_point_m is not None:
-            raise ValueError("river_seed_index 和 river_seed_point_m 只能指定一个。")
-
-        if river_seed_index is not None:
-            row, col = map(int, river_seed_index)
-            if not (0 <= row < self.elevation_m.shape[0] and 0 <= col < self.elevation_m.shape[1]):
-                raise ValueError("river_seed_index 超出 DEM 网格范围。")
-            return row, col
-
-        if river_seed_point_m is None:
-            return None
-
-        seed_x_m, seed_y_m = river_seed_point_m
-        distance2 = (self.x_grid_m - seed_x_m) ** 2 + (self.y_grid_m - seed_y_m) ** 2
-        return tuple(np.unravel_index(np.nanargmin(distance2), distance2.shape))
-
-    def to_dict(self):
-        """以字典形式返回 DEM 数据"""
-        return {
-            "x_grid_m": self.x_grid_m,
-            "y_grid_m": self.y_grid_m,
-            "elevation_m": self.elevation_m,
-            "x_origin_m": self.x_origin_m,
-            "y_origin_m": self.y_origin_m,
-            "river_region_mask": self.river_region_mask,
-        }
-
-
-class SedimentDataProcessor:
-    """河床粒径数据处理类"""
-
-    def __init__(self, bed_template, bed_gradation, gradation_layers):
-        self.bed_template = bed_template
-        self.gradation_layers = gradation_layers
-        self.bed_gradation = bed_gradation
-
-    @classmethod
-    def from_excel(cls, path, sheet_name="Sediment Data", skiprows=2):
-        """从 Excel 文件解析河床粒径数据。"""
-        df = pd.read_excel(path, sheet_name=sheet_name, skiprows=skiprows, header=None).ffill()
-
-        bed_template = dict(zip(df.iloc[:3, 2:4].iloc[:, 0], df.iloc[:3, 2:4].iloc[:, 1]))
-
-        gradation_layers = df.iloc[27:, 1:4].ffill(axis=0)
-        gradation_layers.columns = gradation_layers.iloc[0]
-        gradation_layers = gradation_layers.iloc[1:].reset_index(drop=True)
-
-        bed_gradation = df.iloc[6:27, 1:6].replace({np.nan: 0})
-        bed_gradation.columns = bed_gradation.iloc[0]
-        bed_gradation = bed_gradation.iloc[1:].reset_index(drop=True)
-
-        return cls(bed_template, bed_gradation, gradation_layers)
-
-
-if __name__ == "__main__":
-    bed_path = "data/FlowSedimentData.xlsx"
-    processor = SedimentDataProcessor.from_excel(bed_path)
-    print(processor.bed_template)
-    print(processor.bed_gradation)
-    print(processor.gradation_layers)

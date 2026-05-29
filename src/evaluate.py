@@ -17,7 +17,7 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 
-def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, Ag, regime='fast', output_dir=None):
+def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_time, Ag, case_name='default', output_dir=None):
     if not HAS_MATPLOTLIB:
         print('\n未安装 matplotlib，跳过结果绘图；训练历史和 bed_history 仍会返回。')
         return
@@ -26,7 +26,7 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
         os.makedirs(output_dir, exist_ok=True)
 
     def _save_path(name):
-        path = f'{regime}_{name}.png'
+        path = f'{case_name}_{name}.png'
         return os.path.join(output_dir, path) if output_dir else path
 
     nx = int((bbox['xmax'] - bbox['xmin']) / resolution)
@@ -35,14 +35,17 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
     yc = np.linspace(bbox['ymin'] + resolution / 2, bbox['ymax'] - resolution / 2, ny)
     X, Y = np.meshgrid(xc, yc)
     n_t = len(bed_history)
-    t_u = 'h' if T_physical > 3600 else 's'
-    t_sc = 3600.0 if T_physical > 3600 else 1.0
+    t_u = 'h' if simulation_time > 3600 else 's'
+    t_sc = 3600.0 if simulation_time > 3600 else 1.0
+    output_times = history.get('output_times') or np.linspace(0.0, simulation_time, n_t).tolist()
+    if len(output_times) != n_t:
+        output_times = np.linspace(0.0, simulation_time, n_t).tolist()
     tids = np.linspace(0, n_t - 1, 6, dtype=int)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 11))
     for ax, tid in zip(axes.flatten(), tids):
         zb = bed_history[tid].reshape(ny, nx)
-        t_v = (tid / max(n_t - 1, 1)) * T_physical / t_sc
+        t_v = output_times[tid] / t_sc
         lv = np.linspace(min(zb.min() - 0.01, -0.05), max(zb.max() + 0.01, 0.1), 25)
         im = ax.contourf(X, Y, zb, levels=lv, cmap='terrain')
         ax.contour(X, Y, zb, levels=5, colors='k', linewidths=0.4)
@@ -64,7 +67,7 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
     colors = plt.cm.plasma(np.linspace(0, 1, len(tids)))
     for c, tid in zip(colors, tids):
         zb = bed_history[tid].reshape(ny, nx)
-        t_v = (tid / max(n_t - 1, 1)) * T_physical / t_sc
+        t_v = output_times[tid] / t_sc
         axes[0].plot(xc, zb[j500, :], color=c, lw=2, label=f't={t_v:.1f}{t_u}')
         axes[1].plot(yc, zb[:, i600], color=c, lw=2, label=f't={t_v:.1f}{t_u}')
     for ax, xl, lb in zip(
@@ -90,7 +93,7 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
             ax.semilogy(d, color=c, lw=1.5, ls=ls, label=lb)
     pl(axes[0, 0], history.get('flow_loss', []), 'Flow', 'b')
     pl(axes[0, 0], history.get('continuity', []), 'Cont', 'c', '--')
-    axes[0, 0].set_title('Flow Loss (准稳态)')
+    axes[0, 0].set_title('Flow Loss')
     axes[0, 0].legend()
     axes[0, 0].grid(alpha=0.3)
     pl(axes[0, 1], history.get('momentum_x', []), 'Mom-x', 'r')
@@ -105,7 +108,11 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, T_physical, 
     axes[1, 0].legend()
     axes[1, 0].grid(alpha=0.3)
     if history.get('zb_max'):
-        ta = np.linspace(0, T_physical / t_sc, len(history['zb_max']))
+        ta_source = history.get('time')
+        if ta_source and len(ta_source) == len(history['zb_max']):
+            ta = np.asarray(ta_source, dtype=np.float32) / t_sc
+        else:
+            ta = np.linspace(0, simulation_time / t_sc, len(history['zb_max']))
         axes[1, 1].plot(ta, history['zb_max'], 'g-', lw=2, label='max')
         axes[1, 1].plot(ta, history['zb_min'], 'r-', lw=2, label='min')
         axes[1, 1].set_xlabel(f'Time({t_u})')
