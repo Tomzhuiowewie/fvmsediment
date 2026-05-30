@@ -5,6 +5,7 @@
 # 共用 _CachedMeshTensors 基类实现 GPU 张量缓存。
 
 import torch
+from types import SimpleNamespace
 
 from .config import EPS_DIVISION, EPS_SAFE, EPS_VELOCITY_CLAMP
 from .model import FlowPINN, SedimentPINN
@@ -188,7 +189,6 @@ class SedimentTransportLoss(_CachedMeshTensors):
         fvm_mesh: FVM 网格
         bounds: 坐标归一化边界
         typical_depth / typical_velocity: 物理量级
-        Ag, m: Grass 输沙公式参数
         adaptation_length: 输沙适应长度 (m)
         rho_s: 泥沙密度 (kg/m³)
         w_capacity: 容量损失权重
@@ -204,10 +204,14 @@ class SedimentTransportLoss(_CachedMeshTensors):
         epsilon_default=0.1,
         residual_scale=1.0,
         grain_diameters=None,
-        Ag=0.001,
-        m=3,
         adaptation_length=50.0,
         rho_s=2650.0,
+        rho_w=1000.0,
+        g=9.81,
+        n_manning=0.01,
+        kinematic_viscosity=1.0e-6,
+        wu_theta_cr=0.03,
+        skin_shear_factor=1.0,
         simulation_time=1.0,
         include_time_terms=True,
         alpha_active_layer=10.0,
@@ -222,36 +226,29 @@ class SedimentTransportLoss(_CachedMeshTensors):
         self.epsilon_default = epsilon_default
         self.residual_scale = residual_scale
         self.grain_diameters = grain_diameters
-        self.Ag = Ag
-        self.m = m
         self.adaptation_length = adaptation_length
         self.rho_s = rho_s
+        self.rho_w = rho_w
+        self.g = g
+        self.n_manning = n_manning
+        self.kinematic_viscosity = kinematic_viscosity
+        self.wu_theta_cr = wu_theta_cr
+        self.skin_shear_factor = skin_shear_factor
         self.simulation_time = simulation_time
         self.include_time_terms = include_time_terms
         self.alpha_active_layer = alpha_active_layer
         self.w_capacity = w_capacity
         self.source_sharpness = source_sharpness
+        self.closure_formula = ClosureFormulation(SimpleNamespace(
+            rho_w=self.rho_w,
+            rho_s=self.rho_s,
+            g=self.g,
+            n_manning=self.n_manning,
+            kinematic_viscosity=self.kinematic_viscosity,
+            wu_theta_cr=self.wu_theta_cr,
+            skin_shear_factor=self.skin_shear_factor,
+        ))
         self._init_cache(fvm_mesh)
-
-    def _build_xyt_at_gauss(self, T_norm, device, requires_grad=True):
-        """在高斯积分点构建归一化 (x, y, t) 输入张量。"""
-        self._ensure_tensors(device)
-        return build_xyt(self._gauss_coords_t, T_norm, self.bounds, device, requires_grad=requires_grad)
-
-    def _capacity_closure(self, h, u, v, C_tk, p_k):
-        """计算输沙容量闭合：平衡浓度 C_capacity、侵蚀率 E_tk、沉积率 D_tk。
-
-        基于 Grass 公式计算理论输沙量，再通过适应长度将偏离平衡的部分
-        拆分为侵蚀（源）和沉积（汇），用 smooth_positive 保证可微。
-        """
-        vel_mag = torch.sqrt(u ** 2 + v ** 2 + EPS_DIVISION)
-        q_capacity = p_k * self.Ag * torch.pow(vel_mag, self.m)         # 理论输沙量
-        C_capacity = q_capacity / torch.clamp(h * vel_mag, min=EPS_SAFE)  # 理论输沙浓度
-        adapt_time = self.adaptation_length / torch.clamp(vel_mag, min=EPS_VELOCITY_CLAMP)
-        net_source = h * (C_capacity - C_tk) / adapt_time               # 净源汇项
-        E_tk = smooth_positive(net_source, sharpness=self.source_sharpness)   # 侵蚀率
-        D_tk = smooth_positive(-net_source, sharpness=self.source_sharpness)  # 沉积率
-        return C_capacity, E_tk, D_tk, vel_mag
 
     def _dt(self, q, xyt):
         """Return physical-time derivative from normalized network time."""
@@ -287,21 +284,22 @@ class SedimentTransportLoss(_CachedMeshTensors):
         ny = self._gauss_normals_t[:, 1:2]
 
         beta_safe = torch.clamp(beta_tk, min=EPS_DIVISION)
+        # 输沙存储项：storage = h * C_tk / beta_tk，包含输沙修正系数 beta_tk
         storage = h * C_tk / beta_safe
         storage_t = self._dt(storage, xyt)
         volume_storage = torch.mean(storage_t.view(Nc, npp, K), dim=1) * self.mesh.cell_area
-
+        # 对流通量：advective_flux = h * C_tk * (u * nx + v * ny)，包含输沙浓度 C_tk 和水流通量，沿边界积分
         adv_flux = h * C_tk * (u * nx + v * ny)
         boundary_advection = torch.sum(adv_flux.view(Nc, npp, K) * weights, dim=1)
-
+        # 扩散通量：diffusive_flux = ε * h * ∇C_tk，包含扩散系数 ε 和浓度梯度，沿边界积分
         Cx = self._physical_grad(C_tk, xyt, 0)
         Cy = self._physical_grad(C_tk, xyt, 1)
         diff_flux = epsilon_thk * h * (Cx * nx + Cy * ny)
         boundary_diffusion = torch.sum(diff_flux.view(Nc, npp, K) * weights, dim=1)
-
+        # 源汇项：source = E_tk - D_tk，包含侵蚀率 E_tk 和沉积率 D_tk，在单元内积分
         source = E_tk - D_tk
         volume_source = torch.mean(source.view(Nc, npp, K), dim=1) * self.mesh.cell_area
-
+        # 总残差 = 存储项 + 对流项 - 扩散项 - 源汇项，平方后平均得到损失值
         residual = volume_storage + boundary_advection - boundary_diffusion - volume_source
         loss = torch.mean((residual * self.residual_scale) ** 2)
         return loss, residual
@@ -322,7 +320,11 @@ class SedimentTransportLoss(_CachedMeshTensors):
         返回字典包含：xyt, h, u, v, C_tk, p_k, beta_tk, epsilon_thk,
         E_tk, D_tk, C_capacity, vel_mag。
         """
-        xyt = self._build_xyt_at_gauss(T_norm, device, requires_grad=True)
+        self._ensure_tensors(device)
+        xyt = build_xyt(
+            self._gauss_coords_t, T_norm, self.bounds,
+            device, requires_grad=True,
+        )
 
         # 冻结水动力模型参数，防止输沙训练时更新 flow_model
         old_requires_grad = None
@@ -339,18 +341,28 @@ class SedimentTransportLoss(_CachedMeshTensors):
                 for p, old_flag in zip(flow_model.parameters(), old_requires_grad):
                     p.requires_grad_(old_flag)
 
-        # 输沙浓度和级配
+        # 输沙浓度
         C_tk = sediment_model(xyt)
+        
+        # 级配
         if p_k_override is not None:
             p_k = match_closure(p_k_override, C_tk, 1.0 / C_tk.shape[1])
         else:
             p_k = torch.ones_like(C_tk) / C_tk.shape[1]
 
-        # 闭合参数整理
-        beta_tk = torch.ones_like(C_tk) * self.beta_default
-        epsilon_thk = torch.ones_like(C_tk) * self.epsilon_default
-
-        C_capacity, E_tk, D_tk, vel_mag = self._capacity_closure(h, u, v, C_tk, p_k)
+        # 闭合关系计算
+        beta_tk = torch.ones_like(C_tk) * self.beta_default # 输沙修正系数
+        epsilon_thk = torch.ones_like(C_tk) * self.epsilon_default  # 扩散系数
+        vel_mag = torch.sqrt(u ** 2 + v ** 2 + EPS_DIVISION)    # 速度模长
+        d_k = torch.tensor(self.grain_diameters, dtype=C_tk.dtype, device=C_tk.device)  # 分粒径
+        # Wu (2000) 输沙潜力和容量计算，包含床载和悬移分量，以及相关剪应力和沉速诊断量
+        q_capacity, C_capacity, wu_diag = self.closure_formula.TransportPotential_Wu(h, u, v, d_k, p_k)
+        # 适应时间 = 适应长度 / 速度模长，避免除以零时过大值导致数值不稳定
+        adapt_time = self.adaptation_length / torch.clamp(vel_mag, min=EPS_VELOCITY_CLAMP)  # 适应时间
+        net_source = h * (C_capacity - C_tk) / adapt_time               # 净源汇项
+        # 使用平滑的正负分离函数，确保侵蚀率和沉积率非负且数值稳定
+        E_tk = smooth_positive(net_source, sharpness=self.source_sharpness)   # 侵蚀率
+        D_tk = smooth_positive(-net_source, sharpness=self.source_sharpness)  # 沉积率
 
         return {
             'xyt': xyt, 'h': h, 'u': u, 'v': v,
@@ -358,9 +370,16 @@ class SedimentTransportLoss(_CachedMeshTensors):
             'beta_tk': beta_tk, 'epsilon_thk': epsilon_thk,
             'E_tk': E_tk, 'D_tk': D_tk,
             'C_capacity': C_capacity, 'vel_mag': vel_mag,
+            'q_capacity': q_capacity,
+            'q_b': wu_diag['q_b'],
+            'q_s': wu_diag['q_s'],
+            'tau_b': wu_diag['tau_b'],
+            'tau_skin': wu_diag['tau_skin'],
+            'tau_cr': wu_diag['tau_cr'],
+            'fall_velocity': wu_diag['ws'],
         }
 
-    # 仅输沙损失（独立更新 sediment_model）──
+    # 仅输沙损失（独立更新 sediment_model）
 
     def compute_sediment_loss(
         self,
@@ -388,6 +407,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
             xyt, h, u, v, C_tk,
             closure['beta_tk'], closure['epsilon_thk'], E_tk, D_tk,
         )
+
         capacity_loss = torch.mean((C_tk - C_capacity.detach()) ** 2)
 
         loss = transport_loss + self.w_capacity * capacity_loss
@@ -400,4 +420,92 @@ class SedimentTransportLoss(_CachedMeshTensors):
             'C_max': torch.max(C_tk).item(),
             'Ceq_mean': torch.mean(C_capacity).item(),
             'U_mean': torch.mean(vel_mag).item(),
+        }
+
+
+class ClosureFormulation:
+    """闭合关系统一封装，便于在训练器中调用。
+
+    主要功能是根据当前 flow_model 和 sediment_model 的输出，
+    计算所有中间物理量（h, u, v, C_tk, p_k, E/D 等），
+    供 SVEsPhysicsLoss 和 SedimentTransportLoss 共用。
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    # 沉速计算（Soulsby 1997）
+    def fall_velocity(self, d_k):
+        """
+        Soulsby (1997) noncohesive particle fall velocity.
+        """
+        rho_w = float(getattr(self.cfg, 'rho_w', 1000.0))   # 水密度 (kg/m³)
+        rho_s = float(getattr(self.cfg, 'rho_s', 2650.0))   # 泥沙密度 (kg/m³)
+        g = float(getattr(self.cfg, 'g', 9.81)) # 重力加速度 (m/s²)
+        nu = float(getattr(self.cfg, 'kinematic_viscosity', 1.0e-6))    # 水动力粘度 (m²/s)
+
+        d_k = torch.as_tensor(d_k, dtype=torch.float32) # 分粒径，形状 [K]
+        submerged_gravity = rho_s / rho_w - 1.0 # 浮力修正重力加速度
+        d_star = d_k * torch.pow(
+            torch.as_tensor(submerged_gravity * g / (nu ** 2), dtype=d_k.dtype, device=d_k.device),
+            1.0 / 3.0,
+        )
+        ws = (nu / d_k) * (torch.sqrt(10.36 ** 2 + 1.049 * d_star ** 3) - 10.36)
+        return ws
+
+    # 输沙潜力（Wu 2000）
+    def TransportPotential_Wu(self, h, u, v, d_k, p_k):
+        """计算 Wu et al. (2000) 分粒径总输沙潜力和浓度潜力。
+
+        Returns:
+            q_capacity: p_k * (q_b + q_s), shape compatible with p_k/C_tk.
+            C_capacity: q_capacity / (h |U|).
+            components: diagnostic dictionary with q_b, q_s, tau_b, tau_skin, tau_cr, ws.
+        """
+        device = h.device
+        dtype = h.dtype
+        rho_w = float(getattr(self.cfg, 'rho_w', 1000.0))   # 水密度 (kg/m³)
+        rho_s = float(getattr(self.cfg, 'rho_s', 2650.0))   # 泥沙密度 (kg/m³)
+        g = float(getattr(self.cfg, 'g', 9.81)) # 重力加速度 (m/s²)
+        n_manning = float(getattr(self.cfg, 'n_manning', 0.01)) # Manning 糙率系数
+        theta_cr = float(getattr(self.cfg, 'wu_theta_cr', 0.03))    # Wu (2000) 临界剪应力参数
+        skin_factor = float(getattr(self.cfg, 'skin_shear_factor', 1.0))    # 床面剪应力修正系数
+
+        vel_mag = torch.sqrt(u ** 2 + v ** 2 + EPS_DIVISION)    # 速度模长
+        h_safe = torch.clamp(h, min=0.05)   # 最小水深
+
+        tau_b = rho_w * g * n_manning ** 2 * vel_mag ** 2 / torch.pow(h_safe, 1.0 / 3.0)    # 床面剪应力
+        tau_skin = torch.clamp(torch.as_tensor(skin_factor, dtype=dtype, device=device), 0.0, 1.0) * tau_b  # 皮肤剪应力
+
+        d_k = torch.as_tensor(d_k, dtype=dtype, device=device)  # 分粒径，形状 [K]
+        if d_k.dim() == 1:
+            d_k = d_k.view(1, -1)
+        d_k = torch.clamp(d_k, min=EPS_DIVISION)
+
+        R = torch.as_tensor(max(rho_s / rho_w - 1.0, EPS_DIVISION), dtype=dtype, device=device)
+        tau_cr = theta_cr * (rho_s - rho_w) * g * d_k
+        tau_cr = torch.clamp(tau_cr, min=EPS_DIVISION)
+        ws = self.fall_velocity(d_k).to(device=device, dtype=dtype)
+        transport_scale = torch.sqrt(R * g * d_k ** 3)
+
+        q_b = 0.0053 * transport_scale * torch.relu(tau_skin / tau_cr - 1.0) ** 2.2
+
+        suspension_stage = torch.relu((tau_b / tau_cr - 1.0) * vel_mag / torch.clamp(ws, min=EPS_DIVISION))
+        q_s = 2.62e-5 * transport_scale * suspension_stage ** 1.74
+
+        active_bedload = tau_skin > tau_cr
+        active_suspended = (tau_b > tau_cr) & active_bedload    
+
+        q_b = torch.where(active_bedload, q_b, torch.zeros_like(q_b))
+        q_s = torch.where(active_suspended, q_s, torch.zeros_like(q_s))
+
+        q_capacity = p_k * (q_b + q_s)
+        C_capacity = q_capacity / torch.clamp(h * vel_mag, min=EPS_SAFE)
+        return q_capacity, C_capacity, {
+            'q_b': q_b,
+            'q_s': q_s,
+            'tau_b': tau_b,
+            'tau_skin': tau_skin,
+            'tau_cr': tau_cr,
+            'ws': ws,
         }

@@ -20,6 +20,7 @@ class DecoupledTrainer:
         sediment_transport_loss_fn,
         simulation_time,
         porosity=0.4,
+        bed_slope_coefficient=0.2,
         flow_lr=1e-4,
         transport_lr=1e-4,
     ):
@@ -31,6 +32,7 @@ class DecoupledTrainer:
         self.sediment_transport_loss_fn = sediment_transport_loss_fn
         self.simulation_time = simulation_time
         self.porosity = porosity
+        self.bed_slope_coefficient = bed_slope_coefficient
         self.xi = 1.0 / (1.0 - porosity)
         self.rho_bulk = self.sediment_transport_loss_fn.rho_s * (1.0 - porosity)
         self.last_bed = self.mesh.zb.copy()
@@ -60,7 +62,6 @@ class DecoupledTrainer:
             'flow_loss': [],    # 水动力损失（SVEs PDE残差 + BC损失）
             'sediment_loss': [],    # 输沙总损失（输沙 PDE 残差 + 容量损失）
             'transport_loss': [],   # 输沙损失（浓度对流扩散）
-            'gradation_loss': [],   # 显式级配更新占位记录
             'capacity_loss': [],    # 容量损失()
             'continuity': [],   # 连续性损失
             'momentum_x': [],
@@ -180,40 +181,36 @@ class DecoupledTrainer:
         d90 = d_sorted[idx]
         return np.maximum(self.sediment_transport_loss_fn.alpha_active_layer * d90, 1.0e-4).astype(np.float32)
 
-    def update_gradation_state(self, T, new_bed):
+    def update_gradation_state(self, T, new_bed, closure=None, bed_change_rate_k=None):
         if self.sediment_model is None:
             return None
 
-        self.flow_model.eval()
-        self.sediment_model.eval()
-        p_k_gauss = self._gradation_at_gauss_tensor()
-        with torch.no_grad():
-            closure = self.sediment_transport_loss_fn.compute_closure(
-                self.sediment_model,
-                self.flow_model,
-                T,
-                self.device,
-                p_k_override=p_k_gauss,
-                freeze_flow_params=True,
-            )
+        if closure is None:
+            closure = self._compute_bed_change_closure(T)
 
         npp = self.mesh.n_points_per_cell
         nc = self.mesh.n_cells
         n_grains = self.active_layer_frac.shape[1]
-        net_deposition_rate = (closure['D_tk'] - closure['E_tk']).detach().view(nc, npp, n_grains).mean(dim=1)
-        delta_m_bed = net_deposition_rate.cpu().numpy() * self.window_dt_current
 
-        rho_bulk = self.rho_bulk
-        m1_old = self.active_layer_frac * rho_bulk
-        m2_old = self.second_layer_frac * rho_bulk
-
-        delta_zb = np.asarray(new_bed, dtype=np.float32) - self.last_bed.astype(np.float32)
-        delta1_old = self.delta1.copy()
-        delta2_old = self.delta2.copy()
-        delta1_new = self._active_layer_thickness_np(self.active_layer_frac)
-        delta2_change = delta_zb - (delta1_new - delta1_old)
-        delta2_new = np.maximum(delta2_old + delta2_change, 1.0e-4)
-
+        if bed_change_rate_k is None:
+            _, _, bed_change_rate_k = self._exner_dzb_dt_cell(T, closure=closure)
+        delta_m_bed = (
+            bed_change_rate_k
+            * self.rho_bulk
+            * self.window_dt_current
+        )
+        # 计算有效沉积物密度
+        rho_bulk = self.rho_bulk    # 有效沉积物密度 = 颗粒密度 * (1 - 孔隙率)，包含孔隙率影响
+        m1_old = self.active_layer_frac * rho_bulk  # 活动层质量 = 活动层级配 * 有效沉积物密度
+        m2_old = self.second_layer_frac * rho_bulk  # 次表层质量 = 次表层级配 * 有效沉积物密度
+        # 床面变化量 delta_zb = 新床面高度 - 上次床面高度，包含床面变化引起的级配调整驱动力
+        delta_zb = np.asarray(new_bed, dtype=np.float32) - self.last_bed.astype(np.float32) # 床面变化量 = 新床面高度 - 上次床面高度
+        delta1_old = self.delta1.copy() # 活动层厚度 = α * d90，其中 d90 是粒径分布中累计百分比达到 90% 的粒径，α 是经验系数
+        delta2_old = self.delta2.copy() # 次表层厚度 = 1.0 - 活动层厚度，假设总沉积物层厚度为 1.0
+        delta1_new = self._active_layer_thickness_np(self.active_layer_frac)    # 新活动层厚度 = α * d90，随着级配变化动态调整活动层厚度
+        delta2_change = delta_zb - (delta1_new - delta1_old)    # 次表层厚度变化量 = 床面变化量 - 活动层厚度变化量，假设床面变化主要由活动层厚度变化引起，次表层厚度变化是剩余的床面变化
+        delta2_new = np.maximum(delta2_old + delta2_change, 1.0e-4) # 新次表层厚度 = max(旧次表层厚度 + 次表层厚度变化量, 1.0e-4)，保证次表层厚度不小于一个最小值，避免数值不稳定
+        # 级配更新：根据床面变化引起的活动层和次表层厚度变化，调整活动层和次表层的质量分布，保持总质量守恒。使用 m_star 选择合适的质量调整方案，保证级配更新的稳定性和物理合理性。
         m_star = np.where(delta2_change[:, None] >= 0.0, m1_old, m2_old)
         m1_new = (delta_m_bed + m1_old * delta1_old[:, None] - m_star * delta2_change[:, None]) / delta1_new[:, None]
         m2_new = (m2_old * delta2_old[:, None] + m_star * delta2_change[:, None]) / delta2_new[:, None]
@@ -225,21 +222,19 @@ class DecoupledTrainer:
         self.delta1 = delta1_new.astype(np.float32)
         self.delta2 = delta2_new.astype(np.float32)
         self.last_bed = np.asarray(new_bed, dtype=np.float32).copy()
-        self.history['gradation_loss'].append(0.0)
         self.history['p_min'].append(float(np.min(self.active_layer_frac)))
         self.history['p_max'].append(float(np.max(self.active_layer_frac)))
         return self.active_layer_frac
 
-    def _exner_dzb_dt_cell(self, T):
-        """用总输沙通量边界积分显式计算每个单元的床面变化率。"""
+    def _compute_bed_change_closure(self, T):
         if self.sediment_model is None:
-            return np.zeros(self.mesh.n_cells, dtype=np.float32)
+            return None
 
         self.flow_model.eval()
         self.sediment_model.eval()
         p_k_gauss = self._gradation_at_gauss_tensor()
 
-        closure = self.sediment_transport_loss_fn.compute_closure(
+        return self.sediment_transport_loss_fn.compute_closure(
             self.sediment_model,
             self.flow_model,
             T,
@@ -248,39 +243,60 @@ class DecoupledTrainer:
             freeze_flow_params=True,
         )
 
+    def _exner_dzb_dt_cell(self, T, closure=None):
+        """按粒径组 D-E 源汇显式计算每个单元的床面变化率。"""
+        if self.sediment_model is None:
+            return np.zeros(self.mesh.n_cells, dtype=np.float32), None, None
+
+        if closure is None:
+            closure = self._compute_bed_change_closure(T)
+
         npp = self.mesh.n_points_per_cell
         nc = self.mesh.n_cells
         loss_fn = self.sediment_transport_loss_fn
+        n_grains = closure['E_tk'].shape[1]
+        # 每个单元的净沉积率 = 沉积率 D_tk - 侵蚀率 E_tk，在高斯点上平均得到单元尺度的净沉积率
+        net_deposition_rate = (
+            closure['D_tk'] - closure['E_tk']
+        ).detach().view(nc, npp, n_grains).mean(dim=1)
+        # 计算床面坡度修正项
         weights = loss_fn._gauss_weights_t.view(nc, npp, 1)
         nx = loss_fn._gauss_normals_t[:, 0:1]
         ny = loss_fn._gauss_normals_t[:, 1:2]
-
-        h = closure['h']
-        u = closure['u']
-        v = closure['v']
-        C_tk = closure['C_tk']
-        epsilon_thk = closure['epsilon_thk']
-
-        adv_flux = h * C_tk * (u * nx + v * ny)
-        Cx = loss_fn._physical_grad(C_tk, closure['xyt'], 0)
-        Cy = loss_fn._physical_grad(C_tk, closure['xyt'], 1)
-        diff_flux = epsilon_thk * h * (Cx * nx + Cy * ny)
-        total_sediment_flux = torch.sum(adv_flux - diff_flux, dim=1, keepdim=True)
-
-        boundary_integral = torch.sum(
-            total_sediment_flux.view(nc, npp, 1) * weights,
-            dim=1,
-        ).squeeze(1)
-        dzb_dt = -self.xi * boundary_integral / (
-            (loss_fn.rho_s + 1.0e-8) * self.mesh.cell_area
+        dzb_dx_cell, dzb_dy_cell = self.mesh.get_bed_gradient(self.device)
+        gauss_cell_id = torch.as_tensor(self.mesh.gauss_cell_id, dtype=torch.long, device=self.device)
+        dzb_dx = dzb_dx_cell[gauss_cell_id].view(nc * npp, 1)
+        dzb_dy = dzb_dy_cell[gauss_cell_id].view(nc * npp, 1)
+        bed_slope_normal = dzb_dx * nx + dzb_dy * ny
+        tau_skin = torch.clamp(closure['tau_skin'], min=1.0e-8)
+        tau_cr = torch.clamp(closure['tau_cr'], min=1.0e-8)
+        kappa_bk = self.bed_slope_coefficient * torch.sqrt(
+            tau_cr / torch.maximum(tau_skin, tau_cr)
         )
-        return dzb_dt.detach().cpu().numpy().astype(np.float32)
+        q_bk = closure['p_k'] * closure['q_b']
+        slope_flux = kappa_bk * torch.abs(q_bk) * bed_slope_normal
+        slope_term = torch.sum(
+            slope_flux.view(nc, npp, n_grains) * weights,
+            dim=1,
+        ) / self.mesh.cell_area
+        # 床面变化率 dzb/dt = (净沉积率 + 坡度修正项) / (ρ_s * (1 - porosity))，包含净沉积率和床面坡度修正项，除以有效沉积物密度得到床面变化率
+        dzb_dt_k = (net_deposition_rate + slope_term.detach()) / (
+            loss_fn.rho_s * (1.0 - self.porosity) + 1.0e-8
+        )
+
+        dzb_dt = torch.sum(dzb_dt_k, dim=1)
+        dzb_dt_np = dzb_dt.cpu().numpy().astype(np.float32)
+        dzb_dt_k_np = dzb_dt_k.cpu().numpy().astype(np.float32)
+        return dzb_dt_np, closure, dzb_dt_k_np
 
     def update_bed_explicit(self, T, window_dt=None, max_bed_change_per_step=None):
         if window_dt is None:
             window_dt = self.window_dt
-        dzb_dt = self._exner_dzb_dt_cell(T)
+        # 计算每个单元的床面变化率 dzb/dt
+        dzb_dt, closure, dzb_dt_k = self._exner_dzb_dt_cell(T)
+        # 根据 dzb/dt 和窗口时间步长 window_dt 显式更新河床高度 zb，同时根据 max_bed_change_per_step 限制最大床面变化
         raw_delta_zb = dzb_dt * window_dt
+        
         max_delta = float(np.max(np.abs(raw_delta_zb))) if raw_delta_zb.size else 0.0
         dt_scale = 1.0
         if max_bed_change_per_step is not None and max_bed_change_per_step > 0.0 and max_delta > max_bed_change_per_step:
@@ -289,12 +305,13 @@ class DecoupledTrainer:
         self.window_dt_current = window_dt * dt_scale
         new_bed = self.mesh.zb.astype(np.float32) + dzb_dt * self.window_dt_current
         self.mesh.update_bed(new_bed)
+
         self.history['exner_dzb_dt_min'].append(float(np.min(dzb_dt)))
         self.history['exner_dzb_dt_max'].append(float(np.max(dzb_dt)))
         self.history['bed_dt_scale'].append(float(dt_scale))
         self.history['bed_dt_effective'].append(float(self.window_dt_current))
         self.history['bed_delta_max'].append(float(max_delta * dt_scale))
-        return new_bed
+        return new_bed, closure, dzb_dt_k
 
     def _compute_flow_data_loss(self, coords, values, mask=None):
         coords_tensor = torch.tensor(coords, dtype=torch.float32, device=self.device)
@@ -325,7 +342,7 @@ class DecoupledTrainer:
         output_dt,
         flow_epochs_per_window,
         sediment_epochs_per_window,
-        bc_builder=None,
+        bc_builder,
         flow_loss_tol=1e-4,
         sediment_loss_tol=1e-4,
         extra_train_chunk=100,
@@ -345,26 +362,26 @@ class DecoupledTrainer:
         next_output_time = float(output_dt)
         step_index = 0
         eps = max(simulation_time, window_dt, output_dt) * 1.0e-9
-        n_windows = int(np.ceil(simulation_time / window_dt))
+        n_windows = int(np.ceil(simulation_time / window_dt))   # 窗口数
 
         with tqdm(total=n_windows, desc='RAS-like Morph Steps') as pbar:
             while current_time < simulation_time - eps:
+                # 适应最后一个窗口可能不足 window_dt 的情况
                 end_time = min(current_time + window_dt, simulation_time)
                 actual_window_dt = end_time - current_time
+                # 计算当前窗口的训练时间点列表（归一化）
                 T_norm_list = self._time_slices(current_time, end_time, sample_dt)
                 T_end_norm = float(end_time / simulation_time)
 
                 if verbose and step_index % 10 == 0:
-                    print(
-                        f'\n  t={current_time:.3f}s→{end_time:.3f}s: '
-                        f'窗口时间点数={len(T_norm_list)}'
-                    )
+                    print(f'\n  t={current_time:.3f}s→{end_time:.3f}s: '
+                        f'窗口时间点数={len(T_norm_list)}')
 
-                flow_data = bc_builder if bc_builder is not None else None
+                # 水动力训练阶段：训练 SVEs 模型，计算 PDE 残差和边界条件损失
                 flow_loss = self.train_flow_phase(
                     flow_epochs_per_window,
                     T_norm_list,
-                    data_coords=flow_data,
+                    data_coords=bc_builder,
                 )
                 flow_extra_epochs = 0
                 # while (
@@ -379,6 +396,7 @@ class DecoupledTrainer:
                 # if verbose and step_index % 10 == 0:
                 #     print(f'  t={end_time:.3f}s: 训练输沙并更新河床...')
 
+                # 泥沙训练阶段
                 sediment_loss = self.train_sediment_phase(sediment_epochs_per_window, T_norm_list)
                 sediment_extra_epochs = 0
                 # while (
@@ -393,12 +411,20 @@ class DecoupledTrainer:
                 self.history['flow_extra_epochs'].append(flow_extra_epochs)
                 self.history['sediment_extra_epochs'].append(sediment_extra_epochs)
 
-                current_bed = self.update_bed_explicit(
+                # 河床更新
+                current_bed, closure, dzb_dt_k = self.update_bed_explicit(
                     T_end_norm,
                     window_dt=actual_window_dt,
                     max_bed_change_per_step=max_bed_change_per_step,
                 )
-                self.update_gradation_state(T_end_norm, current_bed)
+
+                # 级配更新
+                self.update_gradation_state(
+                    T_end_norm,
+                    current_bed,
+                    closure=closure,
+                    bed_change_rate_k=dzb_dt_k,
+                )
 
                 current_time = end_time
                 self.history['time'].append(float(current_time))
@@ -427,44 +453,3 @@ class DecoupledTrainer:
                 pbar.update(1)
 
         return bed_history
-
-    def run_decoupled_training(
-        self,
-        n_windows,
-        flow_epochs_per_step,
-        sediment_epochs_per_step,
-        bc_coords=None,
-        bc_values=None,
-        bc_mask=None,
-        flow_loss_tol=1e-4,
-        sediment_loss_tol=1e-4,
-        extra_train_chunk=100,
-        max_extra_flow_epochs=0,
-        max_extra_sediment_epochs=0,
-        max_bed_change_per_step=None,
-        verbose=True,
-    ):
-        window_dt = self.simulation_time / max(n_windows - 1, 1)
-
-        if bc_coords is None:
-            bc_builder = None
-        else:
-            def bc_builder(_t_norm):
-                return bc_coords, bc_values, bc_mask
-
-        return self.run_training(
-            simulation_time=self.simulation_time,
-            sample_dt=window_dt,
-            window_dt=window_dt,
-            output_dt=window_dt,
-            flow_epochs_per_window=flow_epochs_per_step,
-            sediment_epochs_per_window=sediment_epochs_per_step,
-            bc_builder=bc_builder,
-            flow_loss_tol=flow_loss_tol,
-            sediment_loss_tol=sediment_loss_tol,
-            extra_train_chunk=extra_train_chunk,
-            max_extra_flow_epochs=max_extra_flow_epochs,
-            max_extra_sediment_epochs=max_extra_sediment_epochs,
-            max_bed_change_per_step=max_bed_change_per_step,
-            verbose=verbose,
-        )

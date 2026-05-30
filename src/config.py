@@ -27,8 +27,23 @@ class SimulationConfig:
     output_dt: float
     typical_depth: float
     typical_velocity: float
-    ag: float
+    g: float
+    n_manning: float
     grain_diameters: List[float]
+    beta_default: float
+    epsilon_default: float
+    sediment_residual_scale: float
+    adaptation_length: float
+    rho_s: float
+    rho_w: float
+    kinematic_viscosity: float
+    wu_theta_cr: float
+    skin_shear_factor: float
+    alpha_active_layer: float
+    w_capacity: float
+    source_sharpness: float
+    porosity: float
+    bed_slope_coefficient: float
     bc_default: Dict[str, Any]
     training: Dict[str, Any]
 
@@ -51,6 +66,9 @@ def load_config(path) -> SimulationConfig:
     physics = data['physics']
     boundary = data['boundary']
     training = data['training']
+    flow = physics['flow']
+    sediment = physics['sediment']
+    morphodynamics = physics.get('morphodynamics', {})
 
     return SimulationConfig(
         bounds=domain['bounds'],
@@ -63,10 +81,25 @@ def load_config(path) -> SimulationConfig:
         sample_dt=float(physics['sample_dt']),
         window_dt=float(physics['window_dt']),
         output_dt=float(physics['output_dt']),
-        typical_depth=float(physics['flow']['typical_depth']),
-        typical_velocity=float(physics['flow']['typical_velocity']),
-        ag=float(physics['sediment']['ag']),
-        grain_diameters=list(physics['sediment']['grain_diameters']),
+        typical_depth=float(flow['typical_depth']),
+        typical_velocity=float(flow['typical_velocity']),
+        g=float(flow.get('g', 9.81)),
+        n_manning=float(flow.get('n_manning', 0.01)),
+        grain_diameters=list(sediment['grain_diameters']),
+        beta_default=float(sediment.get('beta_default', 1.0)),
+        epsilon_default=float(sediment.get('epsilon_default', 0.1)),
+        sediment_residual_scale=float(sediment.get('residual_scale', 1.0)),
+        adaptation_length=float(sediment.get('adaptation_length', 50.0)),
+        rho_s=float(sediment.get('rho_s', 2650.0)),
+        rho_w=float(sediment.get('rho_w', 1000.0)),
+        kinematic_viscosity=float(sediment.get('kinematic_viscosity', 1.0e-6)),
+        wu_theta_cr=float(sediment.get('wu_theta_cr', 0.03)),
+        skin_shear_factor=float(sediment.get('skin_shear_factor', 1.0)),
+        alpha_active_layer=float(sediment.get('alpha_active_layer', 10.0)),
+        w_capacity=float(sediment.get('w_capacity', 0.05)),
+        source_sharpness=float(sediment.get('source_sharpness', EPS_VELOCITY_CLAMP)),
+        porosity=float(morphodynamics.get('porosity', 0.4)),
+        bed_slope_coefficient=float(morphodynamics.get('bed_slope_coefficient', 0.2)),
         bc_default=dict(boundary),
         training=dict(training),
     )

@@ -1,5 +1,5 @@
 # evaluate.py – 训练结果可视化
-# 绘制床面演化等高线、中心线/横断面剖面、训练历史曲线和扩散角验证图。
+# 绘制床面演化等高线、中心线/横断面剖面和训练历史曲线。
 
 import os
 
@@ -17,7 +17,7 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 
-def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_time, Ag, case_name='default', output_dir=None):
+def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_time, case_name='default', output_dir=None):
     if not HAS_MATPLOTLIB:
         print('\n未安装 matplotlib，跳过结果绘图；训练历史和 bed_history 仍会返回。')
         return
@@ -55,7 +55,7 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_t
         ax.set_ylabel('y(m)')
         plt.colorbar(im, ax=ax)
         ax.plot([500, 700, 700, 500, 500], [400, 400, 600, 600, 400], 'r--', lw=1, alpha=0.5)
-    plt.suptitle(f'床面演化 A={Ag}', fontsize=13)
+    plt.suptitle('床面演化', fontsize=13)
     plt.tight_layout()
     plt.savefig(_save_path('bed'), dpi=150, bbox_inches='tight')
     plt.close()
@@ -103,7 +103,6 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_t
     axes[0, 1].grid(alpha=0.3)
     pl(axes[1, 0], history.get('sediment_loss', []), 'Sed', 'g')
     pl(axes[1, 0], history.get('transport_loss', []), 'C PDE', 'teal', ':')
-    pl(axes[1, 0], history.get('gradation_loss', []), 'p update', 'brown', ':')
     axes[1, 0].set_title('Sediment Loss')
     axes[1, 0].legend()
     axes[1, 0].grid(alpha=0.3)
@@ -119,34 +118,11 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_t
         axes[1, 1].set_ylabel('zb(m)')
         axes[1, 1].legend()
         axes[1, 1].grid(alpha=0.3)
-    plt.suptitle(f'训练历史 A={Ag}')
+    plt.suptitle('训练历史')
     plt.tight_layout()
     plt.savefig(_save_path('losses'), dpi=150, bbox_inches='tight')
     plt.close()
     print(f'✓ {_save_path("losses")}')
-    if Ag < 0.01:
-        zb_f = bed_history[-1].reshape(ny, nx)
-        fig, ax = plt.subplots(figsize=(7, 7))
-        ax.contourf(xc, yc, zb_f, levels=20, cmap='terrain')
-        ax.contour(xc, yc, zb_f, levels=[zb_f.max() * 0.05], colors='red', linewidths=2)
-        theta = np.degrees(np.arctan(3 * np.sqrt(3) * 2 / 26))
-        for s in [1, -1]:
-            dx = np.linspace(0, 400, 200)
-            ax.plot(
-                600 + dx,
-                500 + s * dx * np.tan(np.radians(theta)),
-                'w--',
-                lw=2,
-                label=f'Theory {theta:.1f}°',
-            )
-        ax.set_title(f'扩散角 理论={theta:.2f}° A={Ag}')
-        ax.set_aspect('equal')
-        ax.legend()
-        plt.tight_layout()
-        plt.savefig(_save_path('angle'), dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f'✓ {_save_path("angle")} (理论扩散角={theta:.2f}°)')
-
     dz = bed_history[-1].max() - bed_history[0].max()
     print(f'\n  初始峰值: {bed_history[0].max():.4f}m  最终峰值: {bed_history[-1].max():.4f}m')
     print(f'  峰值变化: {dz:+.4f}m ({dz / max(bed_history[0].max(), EPS_SAFE) * 100:.1f}%)')

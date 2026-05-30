@@ -25,10 +25,27 @@ physics:
   flow:
     typical_depth: 10.0
     typical_velocity: 1.0
+    g: 9.81
+    n_manning: 0.01
 
   sediment:
-    ag: 0.001
     grain_diameters: [0.0002,0.0005]
+    beta_default: 1.0
+    epsilon_default: 0.1
+    residual_scale: 1.0
+    adaptation_length: 100
+    rho_s: 2650.0
+    rho_w: 1000.0
+    kinematic_viscosity: 0.000001
+    wu_theta_cr: 0.03
+    skin_shear_factor: 1.0
+    alpha_active_layer: 10.0
+    w_capacity: 0.05
+    source_sharpness: 0.001
+
+  morphodynamics:
+    porosity: 0.4
+    bed_slope_coefficient: 0.2
 
 boundary:
   n_bc: 50
@@ -38,8 +55,8 @@ boundary:
   v: 0.0
 
 training:
-  flow_epochs_per_step: 20
-  sediment_epochs_per_step: 20
+  flow_epochs_per_step: 5
+  sediment_epochs_per_step: 5
   extra_train_chunk: 100
   max_extra_flow_epochs: 600
   max_extra_sediment_epochs: 800
