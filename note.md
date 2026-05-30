@@ -11,8 +11,9 @@
   - `SVEsPhysicsLoss`：二维浅水方程有限体积残差。
   - `SedimentTransportLoss`：总输沙方程有限体积残差。
   - `ClosureFormulation`：沉速公式和 Wu 总输沙潜力公式。
+  - `MorphodynamicsUpdater`：Exner 床变和活动层/第二层级配显式更新。
 - `src/train.py`
-  - `DecoupledTrainer`：按时间窗口训练水动力、训练输沙、显式更新床面和级配。
+  - `DecoupledTrainer`：按时间窗口调度水动力训练、输沙训练和形态动力学更新。
 - `config.yaml`
   - 控制模拟时长、窗口大小、时间项开关、输沙参数、床变参数和训练参数。
 
@@ -334,8 +335,8 @@ $$
 
 代码位置：
 
-- `src/train.py`：`_exner_dzb_dt_cell()`
-- `src/train.py`：`update_bed_explicit()`
+- `src/physics.py`：`MorphodynamicsUpdater.exner_dzb_dt_cell()`
+- `src/physics.py`：`MorphodynamicsUpdater.update_bed_explicit()`
 
 ## 9. 活动层和级配更新
 
@@ -429,7 +430,7 @@ $$
 
 代码位置：
 
-- `src/train.py`：`update_gradation_state()`
+- `src/physics.py`：`MorphodynamicsUpdater.update_gradation_state()`
 
 ## 10. 与 HEC-RAS 的一致性和简化
 

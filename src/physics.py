@@ -4,6 +4,7 @@
 #   SedimentTransportLoss  → 总输沙输移方程 FVM 残差
 # 共用 _CachedMeshTensors 基类实现 GPU 张量缓存。
 
+import numpy as np
 import torch
 from types import SimpleNamespace
 
@@ -423,13 +424,215 @@ class SedimentTransportLoss(_CachedMeshTensors):
         }
 
 
-class ClosureFormulation:
-    """闭合关系统一封装，便于在训练器中调用。
+class MorphodynamicsUpdater:
+    """床变和两层级配显式更新。"""
 
-    主要功能是根据当前 flow_model 和 sediment_model 的输出，
-    计算所有中间物理量（h, u, v, C_tk, p_k, E/D 等），
-    供 SVEsPhysicsLoss 和 SedimentTransportLoss 共用。
-    """
+    def __init__(
+        self,
+        fvm_mesh,
+        device,
+        sediment_transport_loss_fn,
+        porosity=0.4,
+        bed_slope_coefficient=0.2,
+        history=None,
+    ):
+        self.mesh = fvm_mesh
+        self.device = device
+        self.sediment_transport_loss_fn = sediment_transport_loss_fn
+        self.porosity = porosity
+        self.bed_slope_coefficient = bed_slope_coefficient
+        self.rho_bulk = self.sediment_transport_loss_fn.rho_s * (1.0 - porosity)
+        self.last_bed = self.mesh.zb.copy()
+        self.window_dt = 1.0
+        self.window_dt_current = 1.0
+        self.history = history
+
+        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
+        self.active_layer_frac = np.full(
+            (self.mesh.n_cells, n_grains),
+            1.0 / n_grains,
+            dtype=np.float32,
+        )
+        self.second_layer_frac = self.active_layer_frac.copy()
+        self.delta1 = self.active_layer_thickness_np(self.active_layer_frac)
+        self.delta2 = np.full(self.mesh.n_cells, 1.0, dtype=np.float32)
+
+    def gradation_at_gauss_tensor(self):
+        p = self.active_layer_frac[self.mesh.gauss_cell_id]
+        return torch.tensor(p, dtype=torch.float32, device=self.device)
+
+    def active_layer_thickness_np(self, fractions):
+        d = np.asarray(self.sediment_transport_loss_fn.grain_diameters, dtype=np.float32)
+        order = np.argsort(d)
+        d_sorted = d[order]
+        f_sorted = fractions[:, order]
+        cdf = np.cumsum(f_sorted, axis=1)
+        idx = np.argmax(cdf >= 0.9, axis=1)
+        d90 = d_sorted[idx]
+        return np.maximum(
+            self.sediment_transport_loss_fn.alpha_active_layer * d90,
+            1.0e-4,
+        ).astype(np.float32)
+
+    def compute_bed_change_closure(self, sediment_model, flow_model, T):
+        if sediment_model is None:
+            return None
+
+        flow_model.eval()
+        sediment_model.eval()
+        p_k_gauss = self.gradation_at_gauss_tensor()
+        return self.sediment_transport_loss_fn.compute_closure(
+            sediment_model,
+            flow_model,
+            T,
+            self.device,
+            p_k_override=p_k_gauss,
+            freeze_flow_params=True,
+        )
+
+    def exner_dzb_dt_cell(self, sediment_model, flow_model, T, closure=None):
+        if sediment_model is None:
+            return np.zeros(self.mesh.n_cells, dtype=np.float32), None, None
+
+        if closure is None:
+            closure = self.compute_bed_change_closure(sediment_model, flow_model, T)
+
+        npp = self.mesh.n_points_per_cell
+        nc = self.mesh.n_cells
+        loss_fn = self.sediment_transport_loss_fn
+        n_grains = closure['E_tk'].shape[1]
+        net_deposition_rate = (
+            closure['D_tk'] - closure['E_tk']
+        ).detach().view(nc, npp, n_grains).mean(dim=1)
+
+        weights = loss_fn._gauss_weights_t.view(nc, npp, 1)
+        nx = loss_fn._gauss_normals_t[:, 0:1]
+        ny = loss_fn._gauss_normals_t[:, 1:2]
+        dzb_dx_cell, dzb_dy_cell = self.mesh.get_bed_gradient(self.device)
+        gauss_cell_id = torch.as_tensor(self.mesh.gauss_cell_id, dtype=torch.long, device=self.device)
+        dzb_dx = dzb_dx_cell[gauss_cell_id].view(nc * npp, 1)
+        dzb_dy = dzb_dy_cell[gauss_cell_id].view(nc * npp, 1)
+        bed_slope_normal = dzb_dx * nx + dzb_dy * ny
+
+        tau_skin = torch.clamp(closure['tau_skin'], min=1.0e-8)
+        tau_cr = torch.clamp(closure['tau_cr'], min=1.0e-8)
+        kappa_bk = self.bed_slope_coefficient * torch.sqrt(
+            tau_cr / torch.maximum(tau_skin, tau_cr)
+        )
+        q_bk = closure['p_k'] * closure['q_b']
+        slope_flux = kappa_bk * torch.abs(q_bk) * bed_slope_normal
+        slope_term = torch.sum(
+            slope_flux.view(nc, npp, n_grains) * weights,
+            dim=1,
+        ) / self.mesh.cell_area
+
+        dzb_dt_k = (net_deposition_rate + slope_term.detach()) / (
+            loss_fn.rho_s * (1.0 - self.porosity) + 1.0e-8
+        )
+
+        dzb_dt = torch.sum(dzb_dt_k, dim=1)
+        dzb_dt_np = dzb_dt.cpu().numpy().astype(np.float32)
+        dzb_dt_k_np = dzb_dt_k.cpu().numpy().astype(np.float32)
+        return dzb_dt_np, closure, dzb_dt_k_np
+
+    def update_bed_explicit(
+        self,
+        sediment_model,
+        flow_model,
+        T,
+        window_dt=None,
+        max_bed_change_per_step=None,
+    ):
+        if window_dt is None:
+            window_dt = self.window_dt
+
+        dzb_dt, closure, dzb_dt_k = self.exner_dzb_dt_cell(sediment_model, flow_model, T)
+        raw_delta_zb = dzb_dt * window_dt
+        max_delta = float(np.max(np.abs(raw_delta_zb))) if raw_delta_zb.size else 0.0
+        dt_scale = 1.0
+        if (
+            max_bed_change_per_step is not None
+            and max_bed_change_per_step > 0.0
+            and max_delta > max_bed_change_per_step
+        ):
+            dt_scale = max_bed_change_per_step / max(max_delta, 1.0e-12)
+
+        self.window_dt_current = window_dt * dt_scale
+        new_bed = self.mesh.zb.astype(np.float32) + dzb_dt * self.window_dt_current
+        self.mesh.update_bed(new_bed)
+
+        if self.history is not None:
+            self.history['exner_dzb_dt_min'].append(float(np.min(dzb_dt)))
+            self.history['exner_dzb_dt_max'].append(float(np.max(dzb_dt)))
+            self.history['bed_dt_scale'].append(float(dt_scale))
+            self.history['bed_dt_effective'].append(float(self.window_dt_current))
+            self.history['bed_delta_max'].append(float(max_delta * dt_scale))
+
+        return new_bed, closure, dzb_dt_k
+
+    def update_gradation_state(
+        self,
+        sediment_model,
+        flow_model,
+        T,
+        new_bed,
+        closure=None,
+        bed_change_rate_k=None,
+    ):
+        if sediment_model is None:
+            return None
+
+        if closure is None:
+            closure = self.compute_bed_change_closure(sediment_model, flow_model, T)
+
+        if bed_change_rate_k is None:
+            _, _, bed_change_rate_k = self.exner_dzb_dt_cell(
+                sediment_model,
+                flow_model,
+                T,
+                closure=closure,
+            )
+
+        delta_m_bed = bed_change_rate_k * self.rho_bulk * self.window_dt_current
+        rho_bulk = self.rho_bulk
+        m1_old = self.active_layer_frac * rho_bulk
+        m2_old = self.second_layer_frac * rho_bulk
+
+        delta_zb = np.asarray(new_bed, dtype=np.float32) - self.last_bed.astype(np.float32)
+        delta1_old = self.delta1.copy()
+        delta2_old = self.delta2.copy()
+        delta1_new = self.active_layer_thickness_np(self.active_layer_frac)
+        delta2_change = delta_zb - (delta1_new - delta1_old)
+        delta2_new = np.maximum(delta2_old + delta2_change, 1.0e-4)
+
+        m_star = np.where(delta2_change[:, None] >= 0.0, m1_old, m2_old)
+        m1_new = (
+            delta_m_bed
+            + m1_old * delta1_old[:, None]
+            - m_star * delta2_change[:, None]
+        ) / delta1_new[:, None]
+        m2_new = (
+            m2_old * delta2_old[:, None]
+            + m_star * delta2_change[:, None]
+        ) / delta2_new[:, None]
+
+        m1_new = np.clip(m1_new, 1.0e-12, None)
+        m2_new = np.clip(m2_new, 1.0e-12, None)
+        self.active_layer_frac = (m1_new / np.sum(m1_new, axis=1, keepdims=True)).astype(np.float32)
+        self.second_layer_frac = (m2_new / np.sum(m2_new, axis=1, keepdims=True)).astype(np.float32)
+        self.delta1 = delta1_new.astype(np.float32)
+        self.delta2 = delta2_new.astype(np.float32)
+        self.last_bed = np.asarray(new_bed, dtype=np.float32).copy()
+
+        if self.history is not None:
+            self.history['p_min'].append(float(np.min(self.active_layer_frac)))
+            self.history['p_max'].append(float(np.max(self.active_layer_frac)))
+
+        return self.active_layer_frac
+
+
+class ClosureFormulation:
+    """沉速和输沙潜力闭合关系。"""
 
     def __init__(self, cfg):
         self.cfg = cfg
