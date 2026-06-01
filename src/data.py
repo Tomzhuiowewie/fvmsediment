@@ -6,7 +6,7 @@ from .model import FlowPINN
 
 
 def hump_initial_bed(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """hump 算例初始床面：在 [500,700]×[400,600] 区域生成正弦形凸起。"""
+    """hump 算例初始床面：在 [500,700]×[400,600] 区域生成正弦形凸起"""
     in_hump = ((x >= 500) & (x <= 700) & (y >= 400) & (y <= 600))
     zb = np.zeros_like(x)
     zb[in_hump] = (
@@ -187,3 +187,5 @@ class FVMeshPreprocessor:
             torch.tensor(dzb_dx.flatten(), dtype=torch.float32, device=device),
             torch.tensor(dzb_dy.flatten(), dtype=torch.float32, device=device),
         )
+
+

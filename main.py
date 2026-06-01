@@ -131,4 +131,5 @@ def run_hump_evolution_test(config_path="config.yaml"):
 
 if __name__ == '__main__':
     
-    run_hump_evolution_test(config_path="config.yaml")
+    config_path = "config.yaml"
+    run_hump_evolution_test(config_path=config_path)
