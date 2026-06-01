@@ -54,12 +54,8 @@ class SimulationConfig:
 
 def load_config(path) -> SimulationConfig:
     yaml_path = Path(path)
-    if not yaml_path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {yaml_path}")
     with yaml_path.open('r', encoding='utf-8') as f:
         data = yaml.safe_load(f)
-    if not isinstance(data, dict):
-        raise ValueError("配置文件必须是 YAML 字典结构。")
 
     domain = data['domain']
     fvm = data['fvm']
@@ -69,6 +65,7 @@ def load_config(path) -> SimulationConfig:
     flow = physics['flow']
     sediment = physics['sediment']
     morphodynamics = physics.get('morphodynamics', {})
+    typical_velocity = _resolve_typical_velocity(flow.get('typical_velocity', 'auto'), boundary)
 
     return SimulationConfig(
         bounds=domain['bounds'],
@@ -82,7 +79,7 @@ def load_config(path) -> SimulationConfig:
         window_dt=float(physics['window_dt']),
         output_dt=float(physics['output_dt']),
         typical_depth=float(flow['typical_depth']),
-        typical_velocity=float(flow['typical_velocity']),
+        typical_velocity=typical_velocity,
         g=float(flow.get('g', 9.81)),
         n_manning=float(flow.get('n_manning', 0.01)),
         grain_diameters=list(sediment['grain_diameters']),
@@ -103,3 +100,13 @@ def load_config(path) -> SimulationConfig:
         bc_default=dict(boundary),
         training=dict(training),
     )
+
+
+def _resolve_typical_velocity(value, boundary: Dict[str, Any]) -> float:
+    """Resolve velocity scale, optionally tying it to the initial/boundary velocity."""
+    if isinstance(value, str) and value.strip().lower() == 'auto':
+        u0 = float(boundary.get('u', 0.0))
+        v0 = float(boundary.get('v', 0.0))
+        initial_speed = (u0 ** 2 + v0 ** 2) ** 0.5
+        return max(1.2 * initial_speed, EPS_VELOCITY_CLAMP)
+    return max(float(value), EPS_VELOCITY_CLAMP)

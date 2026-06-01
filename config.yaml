@@ -16,31 +16,31 @@ fvm:
 
 physics:
   include_time_terms: true
-  simulation_time: 600
-  n_windows: 200
-  window_dt: 3.0
-  sample_dt: 1.0
-  output_dt: 3.0
+  simulation_time: 600  # 总模拟时间（秒）
+  n_windows: 200  # 模拟窗口数量
+  window_dt: 3.0  # 每个模拟窗口的时间长度（秒）
+  sample_dt: 1.0  # 训练数据采样时间间隔（秒）
+  output_dt: 30  # 结果输出时间间隔（秒）
 
   flow:
-    typical_depth: 10.0
-    typical_velocity: 1.0
+    typical_depth: 12
+    typical_velocity: auto  # 自动绑定 boundary.u/v 的初始速度模长，并留 20% 输出裕度
     g: 9.81
-    n_manning: 0.01
+    n_manning: 0.006  # 曼宁糙率
 
   sediment:
     grain_diameters: [0.0002,0.0005]
     beta_default: 1.0
     epsilon_default: 0.1
     residual_scale: 1.0
-    adaptation_length: 100
+    adaptation_length: 20
     rho_s: 2650.0
     rho_w: 1000.0
     kinematic_viscosity: 0.000001
     wu_theta_cr: 0.03
     skin_shear_factor: 1.0
     alpha_active_layer: 10.0
-    w_capacity: 0.05
+    w_capacity: 0.2
     source_sharpness: 0.001
 
   morphodynamics:
@@ -50,18 +50,18 @@ physics:
 boundary:
   n_bc: 50
   t_normalized: 0.5
-  h: 10.0
-  u: 1.0
-  v: 0.0
+  h: 10.0 # 水深
+  u: 5.0  # 流速
+  v: 0.0  # 横向速度
 
 training:
-  flow_epochs_per_step: 5
-  sediment_epochs_per_step: 5
-  extra_train_chunk: 100
-  max_extra_flow_epochs: 600
-  max_extra_sediment_epochs: 800
+  flow_epochs_per_step: 20
+  sediment_epochs_per_step: 40
+  extra_train_chunk: 50
+  max_extra_flow_epochs: 300
+  max_extra_sediment_epochs:  600
   flow_lr: 0.001
   transport_lr: 0.001
-  flow_loss_tol: 0.0001
+  flow_loss_tol: 0.0005
   sediment_loss_tol: 0.0001
-  max_bed_change_per_step: 0.02
+  max_bed_change_per_step: 0.1 # 每步训练后床面最大允许变化（相对于初始床面）

@@ -216,7 +216,7 @@ class DecoupledTrainer:
         eps = max(simulation_time, window_dt, output_dt) * 1.0e-9
         n_windows = int(np.ceil(simulation_time / window_dt))   # 窗口数
 
-        with tqdm(total=n_windows, desc='RAS-like Morph Steps') as pbar:
+        with tqdm(total=n_windows) as pbar:
             while current_time < simulation_time - eps:
                 # 适应最后一个窗口可能不足 window_dt 的情况
                 end_time = min(current_time + window_dt, simulation_time)

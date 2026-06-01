@@ -9,7 +9,7 @@ def hump_initial_bed(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """hump 算例初始床面：在 [500,700]×[400,600] 区域生成正弦形凸起"""
     in_hump = ((x >= 500) & (x <= 700) & (y >= 400) & (y <= 600))
     zb = np.zeros_like(x)
-    zb[in_hump] = (
+    zb[in_hump] = 3 * (
         np.sin(np.pi * (x[in_hump] - 500) / 200) ** 2
         * np.sin(np.pi * (y[in_hump] - 400) / 200) ** 2
     )

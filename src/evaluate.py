@@ -11,16 +11,38 @@ try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
     HAS_MATPLOTLIB = True
+
+    # --- 配置中文字体 ---
+    _CN_FONT_CANDIDATES = [
+        'Heiti SC',          # macOS 黑体-简
+        'PingFang SC',       # macOS 苹方
+        'STHeiti',           # macOS 华文黑体
+        'Arial Unicode MS',  # macOS 通用字体
+        'SimHei',            # Windows 黑体
+        'Microsoft YaHei',   # Windows 微软雅黑
+        'WenQuanYi Micro Hei',  # Linux
+        'Noto Sans CJK SC',  # Linux
+    ]
+    _available_fonts = {f.name for f in fm.fontManager.ttflist}
+    _cn_font = None
+    for _f in _CN_FONT_CANDIDATES:
+        if _f in _available_fonts:
+            _cn_font = _f
+            break
+    if _cn_font is not None:
+        matplotlib.rcParams['font.sans-serif'] = [_cn_font] + matplotlib.rcParams.get('font.sans-serif', [])
+        matplotlib.rcParams['axes.unicode_minus'] = False
+        print(f'[evaluate] 使用中文字体: {_cn_font}')
+    else:
+        print('[evaluate] 未找到中文字体，中文可能显示为方框')
 except ImportError:
     plt = None
     HAS_MATPLOTLIB = False
 
 
 def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_time, case_name='default', output_dir=None):
-    if not HAS_MATPLOTLIB:
-        print('\n未安装 matplotlib，跳过结果绘图；训练历史和 bed_history 仍会返回。')
-        return
 
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)

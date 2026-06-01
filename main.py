@@ -104,15 +104,15 @@ def run_hump_evolution_test(config_path="config.yaml"):
         sample_dt=cfg.sample_dt,
         window_dt=cfg.window_dt,
         output_dt=cfg.output_dt,
-        flow_epochs_per_window=cfg.training.get('flow_epochs_per_step', 300),
-        sediment_epochs_per_window=cfg.training.get('sediment_epochs_per_step', 400),
+        flow_epochs_per_window=cfg.training.get('flow_epochs_per_step'),
+        sediment_epochs_per_window=cfg.training.get('sediment_epochs_per_step'),
         bc_builder=bc_builder,
-        flow_loss_tol=cfg.training.get('flow_loss_tol', 1e-4),
-        sediment_loss_tol=cfg.training.get('sediment_loss_tol', 1e-4),
-        extra_train_chunk=cfg.training.get('extra_train_chunk', 100),
-        max_extra_flow_epochs=cfg.training.get('max_extra_flow_epochs', 0),
-        max_extra_sediment_epochs=cfg.training.get('max_extra_sediment_epochs', 0),
-        max_bed_change_per_step=cfg.training.get('max_bed_change_per_step', None),
+        flow_loss_tol=cfg.training.get('flow_loss_tol'),
+        sediment_loss_tol=cfg.training.get('sediment_loss_tol'),
+        extra_train_chunk=cfg.training.get('extra_train_chunk'),
+        max_extra_flow_epochs=cfg.training.get('max_extra_flow_epochs'),
+        max_extra_sediment_epochs=cfg.training.get('max_extra_sediment_epochs'),
+        max_bed_change_per_step=cfg.training.get('max_bed_change_per_step'),
     )
 
     # 9. 可视化结果 
@@ -124,6 +124,7 @@ def run_hump_evolution_test(config_path="config.yaml"):
         history=trainer.history,
         simulation_time=cfg.simulation_time,
         case_name='hump',
+        output_dir='outputs',
     )
 
     return bed_history, trainer.history
