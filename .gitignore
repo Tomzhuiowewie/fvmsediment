@@ -30,6 +30,8 @@ data/*
 !data/.gitkeep
 output/*
 !output/.gitkeep
+outputs/*
+!outputs/.gitkeep
 
 # Image / generated files
 image/
