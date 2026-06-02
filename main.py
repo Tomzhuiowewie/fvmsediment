@@ -92,6 +92,9 @@ def run_hump_evolution_test(config_path="config.yaml"):
         porosity=cfg.porosity,
         bed_slope_coefficient=cfg.bed_slope_coefficient,
         min_bed_elevation=cfg.min_bed_elevation,
+        use_bedload_flux_divergence=cfg.use_bedload_flux_divergence,
+        exchange_weight=cfg.exchange_weight,
+        bed_slope_diffusion_weight=cfg.bed_slope_diffusion_weight,
         flow_lr=cfg.training.get('flow_lr', 1e-4),
         transport_lr=cfg.training.get('transport_lr', 1e-4),
     )

@@ -24,6 +24,9 @@ class DecoupledTrainer:
         porosity=0.4,
         bed_slope_coefficient=0.2,
         min_bed_elevation=None,
+        use_bedload_flux_divergence=True,
+        exchange_weight=1.0,
+        bed_slope_diffusion_weight=1.0,
         flow_lr=1e-4,
         transport_lr=1e-4,
     ):
@@ -64,6 +67,10 @@ class DecoupledTrainer:
             'exner_dzb_dt_max': [],
             'exchange_dzb_dt_min': [],
             'exchange_dzb_dt_max': [],
+            'bedload_dzb_dt_min': [],
+            'bedload_dzb_dt_max': [],
+            'slope_dzb_dt_min': [],
+            'slope_dzb_dt_max': [],
             'bed_dt_scale': [],
             'bed_dt_effective': [],
             'bed_delta_max': [],
@@ -84,6 +91,9 @@ class DecoupledTrainer:
             porosity=porosity,
             bed_slope_coefficient=bed_slope_coefficient,
             min_bed_elevation=min_bed_elevation,
+            use_bedload_flux_divergence=use_bedload_flux_divergence,
+            exchange_weight=exchange_weight,
+            bed_slope_diffusion_weight=bed_slope_diffusion_weight,
             history=self.history,
         )
 

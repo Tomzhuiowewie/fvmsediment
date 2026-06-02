@@ -508,6 +508,9 @@ class MorphodynamicsUpdater:
         porosity=0.4,
         bed_slope_coefficient=0.2,
         min_bed_elevation=None,
+        use_bedload_flux_divergence=True,
+        exchange_weight=1.0,
+        bed_slope_diffusion_weight=1.0,
         history=None,
     ):
         self.mesh = fvm_mesh
@@ -516,6 +519,9 @@ class MorphodynamicsUpdater:
         self.porosity = porosity
         self.bed_slope_coefficient = bed_slope_coefficient
         self.min_bed_elevation = min_bed_elevation
+        self.use_bedload_flux_divergence = use_bedload_flux_divergence
+        self.exchange_weight = exchange_weight
+        self.bed_slope_diffusion_weight = bed_slope_diffusion_weight
         self.rho_bulk = self.sediment_transport_loss_fn.rho_s * (1.0 - porosity)
         self.last_bed = self.mesh.zb.copy()
         self.window_dt = 1.0
@@ -599,24 +605,43 @@ class MorphodynamicsUpdater:
             tau_cr / torch.maximum(tau_skin, tau_cr)
         )
         q_bk = closure['p_k'] * closure['q_b']
+        vel_mag = torch.clamp(closure['vel_mag'], min=1.0e-8)
+        qbx = q_bk * closure['u'] / vel_mag
+        qby = q_bk * closure['v'] / vel_mag
+        bedload_flux = qbx * nx + qby * ny
+        bedload_divergence = torch.sum(
+            bedload_flux.view(nc, npp, n_grains) * weights,
+            dim=1,
+        ) / self.mesh.cell_area
+        if not self.use_bedload_flux_divergence:
+            bedload_divergence = torch.zeros_like(bedload_divergence)
+
         slope_flux = kappa_bk * torch.abs(q_bk) * bed_slope_normal
         slope_term = torch.sum(
             slope_flux.view(nc, npp, n_grains) * weights,
             dim=1,
         ) / self.mesh.cell_area
 
-        # Volumetric Exner equation for the non-equilibrium exchange model:
-        #   (1 - porosity) dzb/dt = D - E + slope_diffusion
+        # Volumetric Exner equation:
+        #   (1 - porosity) dzb/dt = exchange_weight*(D - E)
+        #       - div(q_b) + bed_slope_diffusion_weight*slope_diffusion
         # E/D are already volumetric rates [m/s], so do not divide by rho_s.
         dzb_dt_k = (
-            net_deposition_rate
-            + slope_term.detach()
+            self.exchange_weight * net_deposition_rate
+            - bedload_divergence.detach()
+            + self.bed_slope_diffusion_weight * slope_term.detach()
         ) / (1.0 - self.porosity + 1.0e-8)
 
         if self.history is not None:
             exchange_dzb_dt = torch.sum(net_deposition_rate / (1.0 - self.porosity + 1.0e-8), dim=1)
+            bedload_dzb_dt = torch.sum(-bedload_divergence / (1.0 - self.porosity + 1.0e-8), dim=1)
+            slope_dzb_dt = torch.sum(slope_term / (1.0 - self.porosity + 1.0e-8), dim=1)
             self.history['exchange_dzb_dt_min'].append(float(torch.min(exchange_dzb_dt).detach().cpu()))
             self.history['exchange_dzb_dt_max'].append(float(torch.max(exchange_dzb_dt).detach().cpu()))
+            self.history.setdefault('bedload_dzb_dt_min', []).append(float(torch.min(bedload_dzb_dt).detach().cpu()))
+            self.history.setdefault('bedload_dzb_dt_max', []).append(float(torch.max(bedload_dzb_dt).detach().cpu()))
+            self.history.setdefault('slope_dzb_dt_min', []).append(float(torch.min(slope_dzb_dt).detach().cpu()))
+            self.history.setdefault('slope_dzb_dt_max', []).append(float(torch.max(slope_dzb_dt).detach().cpu()))
 
         dzb_dt = torch.sum(dzb_dt_k, dim=1) # 总床变速率
         dzb_dt_np = dzb_dt.cpu().numpy().astype(np.float32) # 转为 numpy 数组，供显式更新使用

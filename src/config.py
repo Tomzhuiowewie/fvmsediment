@@ -49,6 +49,9 @@ class SimulationConfig:
     porosity: float
     bed_slope_coefficient: float
     min_bed_elevation: Optional[float]
+    use_bedload_flux_divergence: bool
+    exchange_weight: float
+    bed_slope_diffusion_weight: float
     bc_default: Dict[str, Any]
     training: Dict[str, Any]
 
@@ -117,6 +120,9 @@ def load_config(path) -> SimulationConfig:
             if morphodynamics.get('min_bed_elevation') is None
             else float(morphodynamics['min_bed_elevation'])
         ),
+        use_bedload_flux_divergence=bool(morphodynamics.get('use_bedload_flux_divergence', True)),
+        exchange_weight=float(morphodynamics.get('exchange_weight', 1.0)),
+        bed_slope_diffusion_weight=float(morphodynamics.get('bed_slope_diffusion_weight', 1.0)),
         bc_default=dict(boundary),
         training=dict(training),
     )

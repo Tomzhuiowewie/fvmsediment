@@ -51,6 +51,9 @@ physics:
     porosity: 0.4
     bed_slope_coefficient: 0.05
     min_bed_elevation: null
+    use_bedload_flux_divergence: true
+    exchange_weight: 0.0
+    bed_slope_diffusion_weight: 1.0
 
 boundary:
   n_bc: 50
