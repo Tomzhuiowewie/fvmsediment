@@ -79,13 +79,14 @@ def plot_bed_evolution(bed_history, plot_context, save_path):
     time_scale = plot_context['time_scale']
     output_times = plot_context['output_times']
     time_ids = plot_context['time_ids']
+    zmax_global = max(float(np.max(zb)) for zb in bed_history)
+    levels = np.linspace(0.0, max(zmax_global + 0.01, 0.1), 25)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 11))
     for ax, tid in zip(axes.flatten(), time_ids):
         zb = bed_history[tid].reshape(ny, nx)
         t_v = output_times[tid] / time_scale
-        lv = np.linspace(min(zb.min() - 0.01, -0.05), max(zb.max() + 0.01, 0.1), 25)
-        im = ax.contourf(X, Y, zb, levels=lv, cmap='terrain')
+        im = ax.contourf(X, Y, zb, levels=levels, cmap='terrain')
         ax.contour(X, Y, zb, levels=5, colors='k', linewidths=0.4)
         ax.set_title(f't={t_v:.1f}{time_unit} max={zb.max():.3f}m')
         ax.set_aspect('equal')
@@ -165,7 +166,18 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
     axes[1, 0].set_title('Sediment Loss')
     axes[1, 0].legend()
     axes[1, 0].grid(alpha=0.3)
-    if history.get('zb_max'):
+    if history.get('exner_dzb_dt_min'):
+        axes[1, 1].semilogy(np.abs(history['exner_dzb_dt_min']), 'r-', lw=1.5, label='Exner min |dzb/dt|')
+        axes[1, 1].semilogy(np.abs(history['exner_dzb_dt_max']), 'g-', lw=1.5, label='Exner max |dzb/dt|')
+        if history.get('exchange_dzb_dt_min'):
+            axes[1, 1].semilogy(np.abs(history['exchange_dzb_dt_min']), 'm--', lw=1.3, label='D-E min |dzb/dt|')
+            axes[1, 1].semilogy(np.abs(history['exchange_dzb_dt_max']), 'c--', lw=1.3, label='D-E max |dzb/dt|')
+        axes[1, 1].set_xlabel('Step')
+        axes[1, 1].set_ylabel('|dzb/dt| (m/s)')
+        axes[1, 1].set_title('Bed Change Rate')
+        axes[1, 1].legend(fontsize=8)
+        axes[1, 1].grid(alpha=0.3)
+    elif history.get('zb_max'):
         ta_source = history.get('time')
         if ta_source and len(ta_source) == len(history['zb_max']):
             ta = np.asarray(ta_source, dtype=np.float32) / time_scale
