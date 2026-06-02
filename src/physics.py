@@ -76,7 +76,24 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         self.simulation_time = simulation_time
         self.include_time_terms = include_time_terms
         self.eps = eps
-        self.residual_scale = 1.0 / (fvm_mesh.cell_area * typical_depth * typical_velocity)
+        cell_area = fvm_mesh.cell_area
+        cell_perimeter = 4.0 * fvm_mesh.resolution
+        time_scale = max(simulation_time, EPS_DIVISION)
+        depth_scale = max(typical_depth, EPS_DIVISION)
+        velocity_scale = max(typical_velocity, EPS_DIVISION)
+        continuity_scale = (
+            cell_area * depth_scale / time_scale
+            + cell_perimeter * depth_scale * velocity_scale
+        )
+        momentum_scale = (
+            cell_area * depth_scale * velocity_scale / time_scale
+            + cell_perimeter * (
+                depth_scale * velocity_scale ** 2
+                + 0.5 * self.g * depth_scale ** 2
+            )
+        )
+        self.continuity_scale = 1.0 / max(continuity_scale, EPS_DIVISION)
+        self.momentum_scale = 1.0 / max(momentum_scale, EPS_DIVISION)
         self._init_cache(fvm_mesh)
 
     def compute_loss(self, model, t, device):
@@ -105,22 +122,25 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         Nc = self.mesh.n_cells
         npp = self.mesh.n_points_per_cell
         weights_r = gauss_weights.view(Nc, npp)
-
+        # 重塑为单元-点结构
         h_r = h.view(Nc, npp)
         u_r = u.view(Nc, npp)
         v_r = v.view(Nc, npp)
         h_cell = torch.mean(h_r, dim=1, keepdim=True)   # 单元平均水深
 
         # ① 连续性方程：∂/∂t∫h dA + ∮ (hu·nx + hv·ny) dS = 0
+        
+        # 平均水深时间导数
         h_t_cell = torch.mean(
             time_derivative(h, xyt, self.simulation_time, self.include_time_terms).view(Nc, npp),
             dim=1,
             keepdim=True,
-        )
+        )   
         vol_h = h_t_cell * self.mesh.cell_area
+        # 边界通量：hu·nx + hv·ny，沿边界积分
         flux_h = (h * u) * nx + (h * v) * ny
         bnd_h = torch.sum(flux_h.view(Nc, npp) * weights_r, dim=1, keepdim=True)
-        cont_res = (vol_h + bnd_h) * self.residual_scale
+        cont_res = (vol_h + bnd_h) * self.continuity_scale
         loss_continuity = torch.mean(cont_res ** 2)
 
         # ② 床面坡度源项：S = -g·h·∇zb·A
@@ -140,7 +160,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
             dim=1, keepdim=True
         ) * self.mesh.cell_area
 
-        # ④ x 方向动量方程
+        # ④ x 方向动量方程：
         flux_mx = (h * u * u + 0.5 * self.g * h * h) * nx + (h * u * v) * ny
         bnd_mx = torch.sum(flux_mx.view(Nc, npp) * weights_r, dim=1, keepdim=True)
         hu_t_cell = torch.mean(
@@ -149,7 +169,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
             keepdim=True,
         )
         vol_mx = hu_t_cell * self.mesh.cell_area
-        mom_x_res = (vol_mx + bnd_mx - slope_x + fric_tx) * self.residual_scale
+        mom_x_res = (vol_mx + bnd_mx - slope_x + fric_tx) * self.momentum_scale
         loss_momentum_x = torch.mean(mom_x_res ** 2)
 
         # ⑤ y 方向动量方程
@@ -161,7 +181,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
             keepdim=True,
         )
         vol_my = hv_t_cell * self.mesh.cell_area
-        mom_y_res = (vol_my + bnd_my - slope_y + fric_ty) * self.residual_scale
+        mom_y_res = (vol_my + bnd_my - slope_y + fric_ty) * self.momentum_scale
         loss_momentum_y = torch.mean(mom_y_res ** 2)
 
         total_loss = loss_continuity + loss_momentum_x + loss_momentum_y
@@ -398,7 +418,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
         device,
         p_k_override=None,
     ):
-        """仅计算输沙 PDE 残差 + 容量损失，用于独立更新 sediment_model。"""
+        """计算仅包含输沙 PDE 残差的损失，用于独立训练 sediment_model 时调用。"""
         closure = self.compute_closure(
             sediment_model, flow_model, T_norm, device,
             p_k_override=p_k_override,
@@ -597,9 +617,9 @@ class MorphodynamicsUpdater:
             self.history['exchange_dzb_dt_min'].append(float(torch.min(exchange_dzb_dt).detach().cpu()))
             self.history['exchange_dzb_dt_max'].append(float(torch.max(exchange_dzb_dt).detach().cpu()))
 
-        dzb_dt = torch.sum(dzb_dt_k, dim=1)
-        dzb_dt_np = dzb_dt.cpu().numpy().astype(np.float32)
-        dzb_dt_k_np = dzb_dt_k.cpu().numpy().astype(np.float32)
+        dzb_dt = torch.sum(dzb_dt_k, dim=1) # 总床变速率
+        dzb_dt_np = dzb_dt.cpu().numpy().astype(np.float32) # 转为 numpy 数组，供显式更新使用
+        dzb_dt_k_np = dzb_dt_k.cpu().numpy().astype(np.float32) # 分粒径床变速率，供级配更新使用
         return dzb_dt_np, closure, dzb_dt_k_np
 
     def update_bed_explicit(
@@ -742,7 +762,7 @@ class ClosureFormulation:
         skin_factor = float(getattr(self.cfg, 'skin_shear_factor', 1.0))    # 床面剪应力修正系数
 
         vel_mag = torch.sqrt(u ** 2 + v ** 2 + EPS_DIVISION)    # 速度模长
-        h_safe = torch.clamp(h, min=0.05)   # 最小水深
+        h_safe = torch.clamp(h, min=0.05)   # 安全水深，避免除以零或过小值导致数值不稳定
 
         tau_b = rho_w * g * n_manning ** 2 * vel_mag ** 2 / torch.pow(h_safe, 1.0 / 3.0)    # 床面剪应力
         tau_skin = torch.clamp(torch.as_tensor(skin_factor, dtype=dtype, device=device), 0.0, 1.0) * tau_b  # 皮肤剪应力

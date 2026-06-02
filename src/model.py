@@ -82,7 +82,7 @@ class FlowPINN(BasePINN):
         typical_h: float, typical_u: float,
     ) -> torch.Tensor:
         h_norm = h / typical_h
-        u_norm = u / (2.0 * typical_u) + 0.5
+        u_norm = u / typical_u
         v_norm = v / (2.0 * typical_u) + 0.5
         return torch.cat([h_norm, u_norm, v_norm], dim=1)
 
@@ -91,7 +91,7 @@ class FlowPINN(BasePINN):
         raw: torch.Tensor, typical_h: float, typical_u: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = raw[:, 0:1] * typical_h
-        u = (raw[:, 1:2] - 0.5) * 2.0 * typical_u
+        u = raw[:, 1:2] * typical_u
         v = (raw[:, 2:3] - 0.5) * 2.0 * typical_u
         return h, u, v
 

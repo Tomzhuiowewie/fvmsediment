@@ -94,16 +94,20 @@ class DecoupledTrainer:
             total_loss = torch.tensor(0.0, device=self.device)
             loss_acc = {'continuity': 0.0, 'momentum_x': 0.0, 'momentum_y': 0.0}
             for t_i in time_list:
+                # PDE物理损失计算
                 physics_loss, loss_dict = self.flow_loss_fn.compute_loss(self.flow_model, t_i, self.device)
+                # 物理损失（SVEs PDE残差 + BC损失）
                 if callable(data_coords):
                     coords_i, values_i, mask_i = data_coords(t_i)
                 else:
-                    coords_i, values_i, mask_i = data_coords, data_values, data_mask
+                    print("警告: data_coords 不是可调用的边界条件构建器，无法提供训练数据。")
                 if coords_i is not None:
                     data_loss = self._compute_flow_data_loss(coords_i, values_i, mask_i)
                     step_loss = physics_loss + 0.5 * data_loss
                 else:
                     step_loss = physics_loss
+                    print("当前训练步骤仅使用PDE物理损失。")
+                # 累积损失并反向传播
                 total_loss = total_loss + step_loss / len(time_list)
                 for key in loss_acc:
                     loss_acc[key] += loss_dict[key] / len(time_list)
@@ -126,13 +130,13 @@ class DecoupledTrainer:
 
         for epoch in range(n_epochs):
             loss_acc = {
-                'transport': 0.0,
-                'capacity': 0.0,
-                'initial': 0.0,
-                'inlet': 0.0,
-                'C_min': None,
-                'C_max': None,
-                'Ceq_mean': 0.0,
+                'transport': 0.0,   # 输沙损失（浓度对流扩散）
+                'capacity': 0.0,    # 容量损失
+                'initial': 0.0, # 初始条件损失
+                'inlet': 0.0,   #  入口条件损失
+                'C_min': None,  # 预测浓度最小值
+                'C_max': None,  # 预测浓度最大值
+                'Ceq_mean': 0.0,    # 平衡浓度平均值（衡量整体预测合理性）
             }
             if self.sediment_model is not None and self.sediment_optimizer is not None:
                 self.sediment_model.train()
@@ -219,21 +223,20 @@ class DecoupledTrainer:
 
         self.simulation_time = float(simulation_time)
         self.window_dt = float(window_dt)
-        self.morphodynamics.window_dt = self.window_dt
         self.history['time'] = []
         self.history['output_times'] = [0.0]
 
-        bed_history = [self.mesh.zb.copy()]
+        bed_history = [self.mesh.zb.copy()] # 初始河床状态
         current_time = 0.0
         next_output_time = float(output_dt)
         step_index = 0
-        eps = max(simulation_time, window_dt, output_dt) * 1.0e-9
-        n_windows = int(np.ceil(simulation_time / window_dt))   # 窗口数
+        eps = max(simulation_time, self.window_dt, output_dt) * 1.0e-9
+        n_windows = int(np.ceil(simulation_time / self.window_dt))   # 窗口数
 
         with tqdm(total=n_windows) as pbar:
             while current_time < simulation_time - eps:
                 # 适应最后一个窗口可能不足 window_dt 的情况
-                end_time = min(current_time + window_dt, simulation_time)
+                end_time = min(current_time + self.window_dt, simulation_time)
                 actual_window_dt = end_time - current_time
                 # 计算当前窗口的训练时间点列表（归一化）
                 T_norm_list = self._time_slices(current_time, end_time, sample_dt)

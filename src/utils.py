@@ -1,8 +1,9 @@
 # utils.py - 通用数值工具
 # 提供坐标归一化、张量闭包匹配、平滑正部等辅助函数。
 
-from typing import Optional
+from typing import Callable, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -71,3 +72,75 @@ def time_derivative(
 def smooth_positive(x: torch.Tensor, sharpness: float = 1e-3) -> torch.Tensor:
     """平滑正部函数，用 softplus 近似 max(x, 0)，在 x=0 处可导。"""
     return F.softplus(x / sharpness) * sharpness
+
+
+def visualize_hump_initial_bed(
+    bed_fn: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
+    bbox: Optional[dict] = None,
+    resolution: float = 20.0,
+    save_path: Optional[str] = 'hump_initial_bed.png',
+    show: bool = False,
+    elev: float = 24.0,
+    azim: float = -72.0,
+):
+    """可视化 hump 初始床面，生成带三角网格线的 3D 曲面图。
+
+    Args:
+        bed_fn: 初始床面函数，签名为 ``bed_fn(x, y) -> zb``。不传时使用
+            ``src.data.hump_initial_bed``。
+        bbox: 物理区域，默认 ``{'xmin': 0, 'xmax': 1000, 'ymin': 0, 'ymax': 1000}``。
+        resolution: 规则采样间距，越小曲面越细。
+        save_path: 图片保存路径；传 ``None`` 时不保存。
+        show: 是否弹出显示窗口。
+        elev: 3D 视角仰角。
+        azim: 3D 视角方位角。
+
+    Returns:
+        matplotlib 的 ``(fig, ax)`` 对象，便于调用端继续调整。
+    """
+    if bed_fn is None:
+        from .data import hump_initial_bed
+
+        bed_fn = hump_initial_bed
+
+    if bbox is None:
+        bbox = {'xmin': 0.0, 'xmax': 1000.0, 'ymin': 0.0, 'ymax': 1000.0}
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise ImportError("visualize_hump_initial_bed 需要安装 matplotlib。") from exc
+
+    x = np.arange(bbox['xmin'], bbox['xmax'] + resolution, resolution)
+    y = np.arange(bbox['ymin'], bbox['ymax'] + resolution, resolution)
+    X, Y = np.meshgrid(x, y)
+    Z = bed_fn(X, Y)
+
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection='3d')
+    surf = ax.plot_trisurf(
+        X.ravel(),
+        Y.ravel(),
+        Z.ravel(),
+        cmap='terrain',
+        edgecolor='k',
+        linewidth=0.35,
+        antialiased=True,
+    )
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_xlim(bbox['xmin'], bbox['xmax'])
+    ax.set_ylim(bbox['ymin'], bbox['ymax'])
+    ax.set_zlim(min(0.0, float(np.min(Z))), max(float(np.max(Z)), 1.0))
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('zb')
+    ax.set_title('Hump Initial Bed')
+    ax.grid(False)
+    fig.colorbar(surf, ax=ax, shrink=0.55, aspect=16, pad=0.08, label='zb')
+    plt.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=160, bbox_inches='tight')
+    if show:
+        plt.show()
+    return fig, ax
