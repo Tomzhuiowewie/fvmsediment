@@ -16,8 +16,8 @@ fvm:
 
 physics:
   include_time_terms: true
-  simulation_time: 30  # 总模拟时间（秒）
-  n_windows: 10  # 模拟窗口数量
+  simulation_time: 180  # 总模拟时间（秒）
+  n_windows: 60  # 模拟窗口数量
   window_dt: 3.0  # 每个模拟窗口的时间长度（秒）
   sample_dt: 1.0  # 训练数据采样时间间隔（秒）
   output_dt: 3  # 结果输出时间间隔（秒）
@@ -33,15 +33,15 @@ physics:
     beta_default: 1.0
     epsilon_default: 0.1
     residual_scale: 1.0
-    adaptation_length: 20
+    adaptation_length: 50
     rho_s: 2650.0
     rho_w: 1000.0
     kinematic_viscosity: 0.000001
     wu_theta_cr: 0.03
     skin_shear_factor: 1.0
     alpha_active_layer: 10.0
-    w_capacity: 0.01
-    w_initial_sediment: 1.0
+    w_capacity: 0.00
+    w_initial_sediment: 5
     initial_concentration: [0.0, 0.0]  # 初始清水条件：各粒径组初始总输沙浓度 C_tk
     w_inlet_sediment: 1.0
     inlet_concentration: [0.0, 0.0]  # 入口清水边界：x=xmin 处各粒径组 C_tk
@@ -49,7 +49,7 @@ physics:
 
   morphodynamics:
     porosity: 0.4
-    bed_slope_coefficient: 0.2
+    bed_slope_coefficient: 0.1
 
 boundary:
   n_bc: 50
@@ -59,8 +59,8 @@ boundary:
   v: 0.0  # 横向速度
 
 training:
-  flow_epochs_per_step: 20
-  sediment_epochs_per_step: 40
+  flow_epochs_per_step: 10
+  sediment_epochs_per_step: 20
   extra_train_chunk: 0
   max_extra_flow_epochs: 0
   max_extra_sediment_epochs:  0
@@ -68,4 +68,4 @@ training:
   transport_lr: 0.001
   flow_loss_tol: 0.0005
   sediment_loss_tol: 0.0001
-  max_bed_change_per_step: 0.1 # 每步训练后床面最大允许变化（相对于初始床面）
+  max_bed_change_per_step: 0.03 # 每步训练后床面最大允许变化（相对于初始床面）
