@@ -79,14 +79,17 @@ def plot_bed_evolution(bed_history, plot_context, save_path):
     time_scale = plot_context['time_scale']
     output_times = plot_context['output_times']
     time_ids = plot_context['time_ids']
+    zmin_global = min(float(np.min(zb)) for zb in bed_history)
     zmax_global = max(float(np.max(zb)) for zb in bed_history)
-    levels = np.linspace(0.0, max(zmax_global + 0.01, 0.1), 25)
+    zmin_plot = min(0.0, zmin_global)
+    zmax_plot = max(zmax_global + 0.01, 0.1)
+    levels = np.linspace(zmin_plot, zmax_plot, 25)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 11))
     for ax, tid in zip(axes.flatten(), time_ids):
         zb = bed_history[tid].reshape(ny, nx)
         t_v = output_times[tid] / time_scale
-        im = ax.contourf(X, Y, zb, levels=levels, cmap='terrain')
+        im = ax.contourf(X, Y, zb, levels=levels, cmap='terrain', extend='both')
         ax.contour(X, Y, zb, levels=5, colors='k', linewidths=0.4)
         ax.set_title(f't={t_v:.1f}{time_unit} max={zb.max():.3f}m')
         ax.set_aspect('equal')
