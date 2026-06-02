@@ -40,23 +40,23 @@ physics:
     wu_theta_cr: 0.02
     skin_shear_factor: 0.9
     alpha_active_layer: 10.0
-    w_capacity: 0.1
+    w_capacity: 1
     w_initial_sediment: 5
-    initial_concentration: [0.00009, 0.000016]  # 接近当前水流输沙能力，避免清水全域冲刷
+    initial_concentration: [0, 0]  # 接近当前水流输沙能力，避免清水全域冲刷
     w_inlet_sediment: 1.0
-    inlet_concentration: [0.00009, 0.000016]  # 入口给定接近平衡浓度，减少饥饿水流下切
+    inlet_concentration: [0, 0]  # 入口给定接近平衡浓度，减少饥饿水流下切
     source_sharpness: 0.000001
 
   morphodynamics:
     porosity: 0.4
     bed_slope_coefficient: 0.05
-    min_bed_elevation: 0.0
+    min_bed_elevation: null
 
 boundary:
   n_bc: 50
   t_normalized: 0.5
-  h: 8 # 水深
-  u: 6.0  # 流速
+  h: 10 # 水深
+  u: 1  # 流速
   v: 0.0  # 横向速度
 
 training:
@@ -69,4 +69,4 @@ training:
   transport_lr: 0.001
   flow_loss_tol: 0.0005
   sediment_loss_tol: 0.0001
-  max_bed_change_per_step: 0.1 # 每步训练后床面最大允许变化（相对于初始床面）
+  max_bed_change_per_step: 0.02 # 每步训练后床面最大允许变化（相对于初始床面）
