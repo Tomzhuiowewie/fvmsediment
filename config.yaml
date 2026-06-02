@@ -16,11 +16,11 @@ fvm:
 
 physics:
   include_time_terms: true
-  simulation_time: 600  # 总模拟时间（秒）
-  n_windows: 200  # 模拟窗口数量
+  simulation_time: 30  # 总模拟时间（秒）
+  n_windows: 10  # 模拟窗口数量
   window_dt: 3.0  # 每个模拟窗口的时间长度（秒）
   sample_dt: 1.0  # 训练数据采样时间间隔（秒）
-  output_dt: 30  # 结果输出时间间隔（秒）
+  output_dt: 3  # 结果输出时间间隔（秒）
 
   flow:
     typical_depth: 12
@@ -40,7 +40,11 @@ physics:
     wu_theta_cr: 0.03
     skin_shear_factor: 1.0
     alpha_active_layer: 10.0
-    w_capacity: 0.2
+    w_capacity: 0.01
+    w_initial_sediment: 1.0
+    initial_concentration: [0.0, 0.0]  # 初始清水条件：各粒径组初始总输沙浓度 C_tk
+    w_inlet_sediment: 1.0
+    inlet_concentration: [0.0, 0.0]  # 入口清水边界：x=xmin 处各粒径组 C_tk
     source_sharpness: 0.001
 
   morphodynamics:
@@ -57,9 +61,9 @@ boundary:
 training:
   flow_epochs_per_step: 20
   sediment_epochs_per_step: 40
-  extra_train_chunk: 50
-  max_extra_flow_epochs: 300
-  max_extra_sediment_epochs:  600
+  extra_train_chunk: 0
+  max_extra_flow_epochs: 0
+  max_extra_sediment_epochs:  0
   flow_lr: 0.001
   transport_lr: 0.001
   flow_loss_tol: 0.0005

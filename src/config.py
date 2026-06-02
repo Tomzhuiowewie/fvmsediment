@@ -41,6 +41,10 @@ class SimulationConfig:
     skin_shear_factor: float
     alpha_active_layer: float
     w_capacity: float
+    w_initial_sediment: float
+    initial_sediment_concentration: List[float]
+    w_inlet_sediment: float
+    inlet_sediment_concentration: List[float]
     source_sharpness: float
     porosity: float
     bed_slope_coefficient: float
@@ -94,6 +98,16 @@ def load_config(path) -> SimulationConfig:
         skin_shear_factor=float(sediment.get('skin_shear_factor', 1.0)),
         alpha_active_layer=float(sediment.get('alpha_active_layer', 10.0)),
         w_capacity=float(sediment.get('w_capacity', 0.05)),
+        w_initial_sediment=float(sediment.get('w_initial_sediment', 1.0)),
+        initial_sediment_concentration=_resolve_initial_sediment_concentration(
+            sediment.get('initial_concentration', 0.0),
+            len(sediment['grain_diameters']),
+        ),
+        w_inlet_sediment=float(sediment.get('w_inlet_sediment', 1.0)),
+        inlet_sediment_concentration=_resolve_initial_sediment_concentration(
+            sediment.get('inlet_concentration', sediment.get('initial_concentration', 0.0)),
+            len(sediment['grain_diameters']),
+        ),
         source_sharpness=float(sediment.get('source_sharpness', EPS_VELOCITY_CLAMP)),
         porosity=float(morphodynamics.get('porosity', 0.4)),
         bed_slope_coefficient=float(morphodynamics.get('bed_slope_coefficient', 0.2)),
@@ -110,3 +124,12 @@ def _resolve_typical_velocity(value, boundary: Dict[str, Any]) -> float:
         initial_speed = (u0 ** 2 + v0 ** 2) ** 0.5
         return max(1.2 * initial_speed, EPS_VELOCITY_CLAMP)
     return max(float(value), EPS_VELOCITY_CLAMP)
+
+
+def _resolve_initial_sediment_concentration(value, n_grains: int) -> List[float]:
+    if isinstance(value, (int, float)):
+        return [float(value)] * n_grains
+    values = [float(v) for v in value]
+    if len(values) != n_grains:
+        raise ValueError("initial_concentration 的长度必须与 grain_diameters 一致。")
+    return values

@@ -217,6 +217,10 @@ class SedimentTransportLoss(_CachedMeshTensors):
         include_time_terms=True,
         alpha_active_layer=10.0,
         w_capacity=0.05,
+        w_initial_sediment=1.0,
+        initial_sediment_concentration=None,
+        w_inlet_sediment=1.0,
+        inlet_sediment_concentration=None,
         source_sharpness=EPS_VELOCITY_CLAMP,
     ):
         self.mesh = fvm_mesh
@@ -239,6 +243,10 @@ class SedimentTransportLoss(_CachedMeshTensors):
         self.include_time_terms = include_time_terms
         self.alpha_active_layer = alpha_active_layer
         self.w_capacity = w_capacity
+        self.w_initial_sediment = w_initial_sediment
+        self.initial_sediment_concentration = initial_sediment_concentration
+        self.w_inlet_sediment = w_inlet_sediment
+        self.inlet_sediment_concentration = inlet_sediment_concentration
         self.source_sharpness = source_sharpness
         self.closure_formula = ClosureFormulation(SimpleNamespace(
             rho_w=self.rho_w,
@@ -410,18 +418,64 @@ class SedimentTransportLoss(_CachedMeshTensors):
         )
 
         capacity_loss = torch.mean((C_tk - C_capacity.detach()) ** 2)
+        initial_loss = self.initial_condition_loss(C_tk) if abs(float(T_norm)) < 1.0e-8 else torch.zeros_like(capacity_loss)
+        inlet_loss = self.inlet_boundary_loss(C_tk)
 
-        loss = transport_loss + self.w_capacity * capacity_loss
+        loss = (
+            transport_loss
+            + self.w_capacity * capacity_loss
+            + self.w_initial_sediment * initial_loss
+            + self.w_inlet_sediment * inlet_loss
+        )
         
         return loss, {
             'transport': transport_loss.item(),
             'capacity': capacity_loss.item(),
+            'initial': initial_loss.item(),
+            'inlet': inlet_loss.item(),
             'residual_mean': torch.mean(torch.abs(residual)).item(),
             'C_min': torch.min(C_tk).item(),
             'C_max': torch.max(C_tk).item(),
             'Ceq_mean': torch.mean(C_capacity).item(),
             'U_mean': torch.mean(vel_mag).item(),
         }
+
+    def initial_condition_loss(self, C_tk):
+        if self.initial_sediment_concentration is None:
+            return torch.zeros((), dtype=C_tk.dtype, device=C_tk.device)
+        target = torch.as_tensor(
+            self.initial_sediment_concentration,
+            dtype=C_tk.dtype,
+            device=C_tk.device,
+        ).view(1, -1)
+        if target.shape[1] != C_tk.shape[1]:
+            raise ValueError("初始泥沙浓度维度必须与泥沙粒径组数量一致。")
+        return torch.mean((C_tk - target.expand_as(C_tk)) ** 2)
+
+    def inlet_boundary_loss(self, C_tk):
+        if self.inlet_sediment_concentration is None:
+            return torch.zeros((), dtype=C_tk.dtype, device=C_tk.device)
+        target = torch.as_tensor(
+            self.inlet_sediment_concentration,
+            dtype=C_tk.dtype,
+            device=C_tk.device,
+        ).view(1, -1)
+        if target.shape[1] != C_tk.shape[1]:
+            raise ValueError("入口泥沙浓度维度必须与泥沙粒径组数量一致。")
+
+        coords = self._gauss_coords_t
+        neighbor_id = torch.as_tensor(self.mesh.gauss_neighbor_id, dtype=torch.long, device=C_tk.device)
+        inlet_x = float(self.mesh.bbox['xmin'])
+        inlet_mask = (neighbor_id < 0) & torch.isclose(
+            coords[:, 0],
+            torch.as_tensor(inlet_x, dtype=coords.dtype, device=coords.device),
+            atol=max(float(self.mesh.resolution) * 1.0e-6, 1.0e-6),
+            rtol=0.0,
+        )
+        if not torch.any(inlet_mask):
+            return torch.zeros((), dtype=C_tk.dtype, device=C_tk.device)
+        inlet_c = C_tk[inlet_mask]
+        return torch.mean((inlet_c - target.expand_as(inlet_c)) ** 2)
 
 
 class MorphodynamicsUpdater:
@@ -501,6 +555,9 @@ class MorphodynamicsUpdater:
         nc = self.mesh.n_cells
         loss_fn = self.sediment_transport_loss_fn
         n_grains = closure['E_tk'].shape[1]
+
+        # E_tk/D_tk are volumetric exchange rates [m/s] because C_tk is a
+        # volumetric concentration and h * C_tk / T_adapt has units of m/s.
         net_deposition_rate = (
             closure['D_tk'] - closure['E_tk']
         ).detach().view(nc, npp, n_grains).mean(dim=1)
@@ -508,6 +565,7 @@ class MorphodynamicsUpdater:
         weights = loss_fn._gauss_weights_t.view(nc, npp, 1)
         nx = loss_fn._gauss_normals_t[:, 0:1]
         ny = loss_fn._gauss_normals_t[:, 1:2]
+
         dzb_dx_cell, dzb_dy_cell = self.mesh.get_bed_gradient(self.device)
         gauss_cell_id = torch.as_tensor(self.mesh.gauss_cell_id, dtype=torch.long, device=self.device)
         dzb_dx = dzb_dx_cell[gauss_cell_id].view(nc * npp, 1)
@@ -526,9 +584,18 @@ class MorphodynamicsUpdater:
             dim=1,
         ) / self.mesh.cell_area
 
-        dzb_dt_k = (net_deposition_rate + slope_term.detach()) / (
-            loss_fn.rho_s * (1.0 - self.porosity) + 1.0e-8
-        )
+        # Volumetric Exner equation for the non-equilibrium exchange model:
+        #   (1 - porosity) dzb/dt = D - E + slope_diffusion
+        # E/D are already volumetric rates [m/s], so do not divide by rho_s.
+        dzb_dt_k = (
+            net_deposition_rate
+            + slope_term.detach()
+        ) / (1.0 - self.porosity + 1.0e-8)
+
+        if self.history is not None:
+            exchange_dzb_dt = torch.sum(net_deposition_rate / (1.0 - self.porosity + 1.0e-8), dim=1)
+            self.history['exchange_dzb_dt_min'].append(float(torch.min(exchange_dzb_dt).detach().cpu()))
+            self.history['exchange_dzb_dt_max'].append(float(torch.max(exchange_dzb_dt).detach().cpu()))
 
         dzb_dt = torch.sum(dzb_dt_k, dim=1)
         dzb_dt_np = dzb_dt.cpu().numpy().astype(np.float32)

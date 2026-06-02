@@ -54,11 +54,15 @@ class DecoupledTrainer:
             'sediment_loss': [],    # 输沙总损失（输沙 PDE 残差 + 容量损失）
             'transport_loss': [],   # 输沙损失（浓度对流扩散）
             'capacity_loss': [],    # 容量损失()
+            'initial_sediment_loss': [],
+            'inlet_sediment_loss': [],
             'continuity': [],   # 连续性损失
             'momentum_x': [],
             'momentum_y': [],
             'exner_dzb_dt_min': [],
             'exner_dzb_dt_max': [],
+            'exchange_dzb_dt_min': [],
+            'exchange_dzb_dt_max': [],
             'bed_dt_scale': [],
             'bed_dt_effective': [],
             'bed_delta_max': [],
@@ -123,6 +127,8 @@ class DecoupledTrainer:
             loss_acc = {
                 'transport': 0.0,
                 'capacity': 0.0,
+                'initial': 0.0,
+                'inlet': 0.0,
                 'C_min': None,
                 'C_max': None,
             }
@@ -139,6 +145,8 @@ class DecoupledTrainer:
                     total_loss = total_loss + sediment_loss / len(time_list)
                     loss_acc['transport'] += sediment_dict['transport'] / len(time_list)
                     loss_acc['capacity'] += sediment_dict['capacity'] / len(time_list)
+                    loss_acc['initial'] += sediment_dict['initial'] / len(time_list)
+                    loss_acc['inlet'] += sediment_dict['inlet'] / len(time_list)
                     loss_acc['C_min'] = (
                         sediment_dict['C_min']
                         if loss_acc['C_min'] is None
@@ -160,6 +168,8 @@ class DecoupledTrainer:
             if loss_acc['C_min'] is not None:
                 self.history['transport_loss'].append(loss_acc['transport'])
                 self.history['capacity_loss'].append(loss_acc['capacity'])
+                self.history['initial_sediment_loss'].append(loss_acc['initial'])
+                self.history['inlet_sediment_loss'].append(loss_acc['inlet'])
                 self.history['C_min'].append(loss_acc['C_min'])
                 self.history['C_max'].append(loss_acc['C_max'])
         return total_loss.item()
