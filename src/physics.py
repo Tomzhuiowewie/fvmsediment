@@ -19,8 +19,7 @@ from .utils import build_xyt, match_closure, smooth_positive, time_derivative
 
 class _CachedMeshTensors:
     """GPU 张量缓存混入基类。
-
-    各 Loss 类每次 compute_loss 都需要高斯点坐标/法向/权重张量。
+    各 Loss 类每次 compute_loss 都需要高斯点坐标/法向/权重张量
     本基类在首次调用时将 NumPy 数组转为 GPU 张量并缓存，
     后续调用直接复用，避免重复创建开销。
     """
@@ -508,6 +507,7 @@ class MorphodynamicsUpdater:
         sediment_transport_loss_fn,
         porosity=0.4,
         bed_slope_coefficient=0.2,
+        min_bed_elevation=None,
         history=None,
     ):
         self.mesh = fvm_mesh
@@ -515,6 +515,7 @@ class MorphodynamicsUpdater:
         self.sediment_transport_loss_fn = sediment_transport_loss_fn
         self.porosity = porosity
         self.bed_slope_coefficient = bed_slope_coefficient
+        self.min_bed_elevation = min_bed_elevation
         self.rho_bulk = self.sediment_transport_loss_fn.rho_s * (1.0 - porosity)
         self.last_bed = self.mesh.zb.copy()
         self.window_dt = 1.0
@@ -645,7 +646,21 @@ class MorphodynamicsUpdater:
             dt_scale = max_bed_change_per_step / max(max_delta, 1.0e-12)
 
         self.window_dt_current = window_dt * dt_scale
-        new_bed = self.mesh.zb.astype(np.float32) + dzb_dt * self.window_dt_current
+        old_bed = self.mesh.zb.astype(np.float32)
+        new_bed = old_bed + dzb_dt * self.window_dt_current
+        if self.min_bed_elevation is not None:
+            new_bed = np.maximum(new_bed, float(self.min_bed_elevation)).astype(np.float32)
+            if self.window_dt_current > 0.0:
+                effective_dzb_dt = (new_bed - old_bed) / self.window_dt_current
+                original_dzb_dt = np.sum(dzb_dt_k, axis=1)
+                ratio = np.divide(
+                    effective_dzb_dt,
+                    original_dzb_dt,
+                    out=np.ones_like(effective_dzb_dt, dtype=np.float32),
+                    where=np.abs(original_dzb_dt) > 1.0e-12,
+                )
+                dzb_dt = effective_dzb_dt.astype(np.float32)
+                dzb_dt_k = (dzb_dt_k * ratio[:, None]).astype(np.float32)
         self.mesh.update_bed(new_bed)
 
         if self.history is not None:
@@ -653,7 +668,7 @@ class MorphodynamicsUpdater:
             self.history['exner_dzb_dt_max'].append(float(np.max(dzb_dt)))
             self.history['bed_dt_scale'].append(float(dt_scale))
             self.history['bed_dt_effective'].append(float(self.window_dt_current))
-            self.history['bed_delta_max'].append(float(max_delta * dt_scale))
+            self.history['bed_delta_max'].append(float(np.max(np.abs(new_bed - old_bed))) if new_bed.size else 0.0)
 
         return new_bed, closure, dzb_dt_k
 

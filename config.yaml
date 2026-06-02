@@ -42,14 +42,15 @@ physics:
     alpha_active_layer: 10.0
     w_capacity: 0.1
     w_initial_sediment: 5
-    initial_concentration: [0.0, 0.0]  # 初始清水条件：各粒径组初始总输沙浓度 C_tk
+    initial_concentration: [0.00009, 0.000016]  # 接近当前水流输沙能力，避免清水全域冲刷
     w_inlet_sediment: 1.0
-    inlet_concentration: [0.0, 0.0]  # 入口清水边界：x=xmin 处各粒径组 C_tk
+    inlet_concentration: [0.00009, 0.000016]  # 入口给定接近平衡浓度，减少饥饿水流下切
     source_sharpness: 0.000001
 
   morphodynamics:
     porosity: 0.4
     bed_slope_coefficient: 0.05
+    min_bed_elevation: 0.0
 
 boundary:
   n_bc: 50

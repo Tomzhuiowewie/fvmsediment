@@ -23,6 +23,7 @@ class DecoupledTrainer:
         simulation_time,
         porosity=0.4,
         bed_slope_coefficient=0.2,
+        min_bed_elevation=None,
         flow_lr=1e-4,
         transport_lr=1e-4,
     ):
@@ -82,6 +83,7 @@ class DecoupledTrainer:
             sediment_transport_loss_fn=self.sediment_transport_loss_fn,
             porosity=porosity,
             bed_slope_coefficient=bed_slope_coefficient,
+            min_bed_elevation=min_bed_elevation,
             history=self.history,
         )
 

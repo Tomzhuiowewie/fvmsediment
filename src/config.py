@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -48,6 +48,7 @@ class SimulationConfig:
     source_sharpness: float
     porosity: float
     bed_slope_coefficient: float
+    min_bed_elevation: Optional[float]
     bc_default: Dict[str, Any]
     training: Dict[str, Any]
 
@@ -111,6 +112,11 @@ def load_config(path) -> SimulationConfig:
         source_sharpness=float(sediment.get('source_sharpness', EPS_VELOCITY_CLAMP)),
         porosity=float(morphodynamics.get('porosity', 0.4)),
         bed_slope_coefficient=float(morphodynamics.get('bed_slope_coefficient', 0.2)),
+        min_bed_elevation=(
+            None
+            if morphodynamics.get('min_bed_elevation') is None
+            else float(morphodynamics['min_bed_elevation'])
+        ),
         bc_default=dict(boundary),
         training=dict(training),
     )
