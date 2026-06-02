@@ -142,7 +142,7 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
     time_unit = plot_context['time_unit']
     time_scale = plot_context['time_scale']
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    fig, axes = plt.subplots(3, 2, figsize=(14, 11))
 
     def pl(ax, d, lb, c, ls='-'):
         if d:
@@ -151,44 +151,63 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
     pl(axes[0, 0], history.get('flow_loss', []), 'Flow', 'b')
     pl(axes[0, 0], history.get('continuity', []), 'Cont', 'c', '--')
     axes[0, 0].set_title('Flow Loss')
-    axes[0, 0].legend()
+    axes[0, 0].legend(fontsize=8)
     axes[0, 0].grid(alpha=0.3)
+
     pl(axes[0, 1], history.get('momentum_x', []), 'Mom-x', 'r')
     pl(axes[0, 1], history.get('momentum_y', []), 'Mom-y', 'm')
     axes[0, 1].set_title('Momentum')
-    axes[0, 1].legend()
+    axes[0, 1].legend(fontsize=8)
     axes[0, 1].grid(alpha=0.3)
+
     pl(axes[1, 0], history.get('sediment_loss', []), 'Sed', 'g')
     pl(axes[1, 0], history.get('transport_loss', []), 'C PDE', 'teal', ':')
     pl(axes[1, 0], history.get('capacity_loss', []), 'Capacity', 'orange', '--')
     pl(axes[1, 0], history.get('initial_sediment_loss', []), 'Initial C', 'purple', '-.')
     pl(axes[1, 0], history.get('inlet_sediment_loss', []), 'Inlet C', 'brown', '-.')
     axes[1, 0].set_title('Sediment Loss')
-    axes[1, 0].legend()
+    axes[1, 0].legend(fontsize=8)
     axes[1, 0].grid(alpha=0.3)
-    if history.get('exner_dzb_dt_min'):
-        axes[1, 1].semilogy(np.abs(history['exner_dzb_dt_min']), 'r-', lw=1.5, label='Exner min |dzb/dt|')
-        axes[1, 1].semilogy(np.abs(history['exner_dzb_dt_max']), 'g-', lw=1.5, label='Exner max |dzb/dt|')
-        if history.get('exchange_dzb_dt_min'):
-            axes[1, 1].semilogy(np.abs(history['exchange_dzb_dt_min']), 'm--', lw=1.3, label='D-E min |dzb/dt|')
-            axes[1, 1].semilogy(np.abs(history['exchange_dzb_dt_max']), 'c--', lw=1.3, label='D-E max |dzb/dt|')
-        axes[1, 1].set_xlabel('Step')
-        axes[1, 1].set_ylabel('|dzb/dt| (m/s)')
-        axes[1, 1].set_title('Bed Change Rate')
+
+    if history.get('C_min'):
+        axes[1, 1].plot(history['C_min'], 'b-', lw=1.5, label='C min')
+        axes[1, 1].plot(history['C_max'], 'r-', lw=1.5, label='C max')
+        if history.get('Ceq_mean'):
+            axes[1, 1].plot(history['Ceq_mean'], 'k--', lw=1.5, label='C capacity mean')
+        axes[1, 1].set_title('Sediment Concentration')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('C')
         axes[1, 1].legend(fontsize=8)
         axes[1, 1].grid(alpha=0.3)
-    elif history.get('zb_max'):
+
+    if history.get('exner_dzb_dt_min'):
+        axes[2, 0].plot(history['exner_dzb_dt_min'], 'r-', lw=1.5, label='Exner min dzb/dt')
+        axes[2, 0].plot(history['exner_dzb_dt_max'], 'g-', lw=1.5, label='Exner max dzb/dt')
+        if history.get('exchange_dzb_dt_min'):
+            axes[2, 0].plot(history['exchange_dzb_dt_min'], 'm--', lw=1.3, label='D-E min dzb/dt')
+            axes[2, 0].plot(history['exchange_dzb_dt_max'], 'c--', lw=1.3, label='D-E max dzb/dt')
+        axes[2, 0].axhline(0.0, color='k', lw=0.8, alpha=0.5)
+        axes[2, 0].set_yscale('symlog', linthresh=1.0e-6)
+        axes[2, 0].set_xlabel('Step')
+        axes[2, 0].set_ylabel('dzb/dt (m/s)')
+        axes[2, 0].set_title('Signed Bed Change Rate')
+        axes[2, 0].legend(fontsize=8)
+        axes[2, 0].grid(alpha=0.3)
+
+    if history.get('zb_max'):
         ta_source = history.get('time')
         if ta_source and len(ta_source) == len(history['zb_max']):
             ta = np.asarray(ta_source, dtype=np.float32) / time_scale
         else:
             ta = np.linspace(0, simulation_time / time_scale, len(history['zb_max']))
-        axes[1, 1].plot(ta, history['zb_max'], 'g-', lw=2, label='max')
-        axes[1, 1].plot(ta, history['zb_min'], 'r-', lw=2, label='min')
-        axes[1, 1].set_xlabel(f'Time({time_unit})')
-        axes[1, 1].set_ylabel('zb(m)')
-        axes[1, 1].legend()
-        axes[1, 1].grid(alpha=0.3)
+        axes[2, 1].plot(ta, history['zb_max'], 'g-', lw=2, label='zb max')
+        axes[2, 1].plot(ta, history['zb_min'], 'r-', lw=2, label='zb min')
+        axes[2, 1].set_title('Bed Elevation Range')
+        axes[2, 1].set_xlabel(f'Time({time_unit})')
+        axes[2, 1].set_ylabel('zb(m)')
+        axes[2, 1].legend(fontsize=8)
+        axes[2, 1].grid(alpha=0.3)
+
     plt.suptitle('Training History')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')

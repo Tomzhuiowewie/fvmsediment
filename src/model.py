@@ -102,9 +102,32 @@ class SedimentPINN(BasePINN):
     """
 
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4,
-                 output_dim=1, positive_output=True):
+                 output_dim=1, positive_output=True, initial_concentration=None):
         self.positive_output = positive_output
         super().__init__(input_dim, hidden_dim, num_block, output_dim)
+        if self.positive_output:
+            self._init_positive_output(output_dim, initial_concentration)
+
+    def _init_positive_output(self, output_dim, initial_concentration):
+        """Start near the prescribed sediment background instead of softplus(0)."""
+        final_linear = self.output_layer[-1]
+        if not isinstance(final_linear, nn.Linear):
+            return
+
+        if initial_concentration is None:
+            target = torch.full((output_dim,), 1.0e-6, dtype=final_linear.bias.dtype)
+        else:
+            target = torch.as_tensor(initial_concentration, dtype=final_linear.bias.dtype)
+            if target.numel() == 1:
+                target = target.repeat(output_dim)
+            if target.numel() != output_dim:
+                raise ValueError("初始泥沙浓度维度必须与 SedimentPINN 输出维度一致。")
+            target = torch.clamp(target, min=1.0e-6)
+
+        bias = torch.log(torch.expm1(target))
+        with torch.no_grad():
+            nn.init.normal_(final_linear.weight, mean=0.0, std=1.0e-4)
+            final_linear.bias.copy_(bias)
 
     def forward(self, xyt: torch.Tensor) -> torch.Tensor:
         x = self.input_layer(xyt)

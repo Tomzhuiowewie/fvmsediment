@@ -32,7 +32,13 @@ def run_hump_evolution_test(config_path="config.yaml"):
     flow_model = FlowPINN(input_dim=3, hidden_dim=64, num_block=4, output_dim=3).to(device)
 
     n_grains = cfg.num_grain_classes
-    sediment_model = SedimentPINN(input_dim=3, hidden_dim=64, num_block=4, output_dim=n_grains).to(device)
+    sediment_model = SedimentPINN(
+        input_dim=3,
+        hidden_dim=64,
+        num_block=4,
+        output_dim=n_grains,
+        initial_concentration=cfg.initial_sediment_concentration,
+    ).to(device)
 
     # 5. 创建物理损失函数
     flow_loss_fn = SVEsPhysicsLoss(

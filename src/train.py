@@ -72,6 +72,7 @@ class DecoupledTrainer:
             'zb_max': [],
             'C_min': [],
             'C_max': [],
+            'Ceq_mean': [],
             'p_min': [],
             'p_max': [],
         }
@@ -131,6 +132,7 @@ class DecoupledTrainer:
                 'inlet': 0.0,
                 'C_min': None,
                 'C_max': None,
+                'Ceq_mean': 0.0,
             }
             if self.sediment_model is not None and self.sediment_optimizer is not None:
                 self.sediment_model.train()
@@ -147,6 +149,7 @@ class DecoupledTrainer:
                     loss_acc['capacity'] += sediment_dict['capacity'] / len(time_list)
                     loss_acc['initial'] += sediment_dict['initial'] / len(time_list)
                     loss_acc['inlet'] += sediment_dict['inlet'] / len(time_list)
+                    loss_acc['Ceq_mean'] += sediment_dict['Ceq_mean'] / len(time_list)
                     loss_acc['C_min'] = (
                         sediment_dict['C_min']
                         if loss_acc['C_min'] is None
@@ -172,6 +175,7 @@ class DecoupledTrainer:
                 self.history['inlet_sediment_loss'].append(loss_acc['inlet'])
                 self.history['C_min'].append(loss_acc['C_min'])
                 self.history['C_max'].append(loss_acc['C_max'])
+                self.history['Ceq_mean'].append(loss_acc['Ceq_mean'])
         return total_loss.item()
 
     def _compute_flow_data_loss(self, coords, values, mask=None):
