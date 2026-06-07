@@ -3,6 +3,7 @@
 # 阶段 3：两个网络联合优化。床面历史由泥沙网络输出的 Δzb 生成。
 
 import numpy as np
+import os
 import sys
 import time
 import torch
@@ -30,6 +31,11 @@ class _ProgressBar:
 
     def close(self, loss=None):
         self.current = self.total
+        self._render(loss=loss)
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    def finish(self, loss=None):
         self._render(loss=loss)
         sys.stdout.write('\n')
         sys.stdout.flush()
@@ -79,6 +85,12 @@ class DecoupledTrainer:
         flow_lr=1e-4,
         transport_lr=1e-4,
         sediment_cell_batch_size=1024,
+        flow_loss_tol=0.0,
+        sediment_loss_tol=0.0,
+        joint_loss_tol=0.0,
+        early_stop_patience=0,
+        early_stop_min_delta=0.0,
+        checkpoint_dir=None,
     ):
         self.flow_model = flow_model
         self.sediment_model = sediment_model
@@ -89,6 +101,12 @@ class DecoupledTrainer:
         self.simulation_time = simulation_time
         self.active_layer_thickness = float(active_layer_thickness)
         self.sediment_cell_batch_size = int(sediment_cell_batch_size)
+        self.flow_loss_tol = float(flow_loss_tol or 0.0)
+        self.sediment_loss_tol = float(sediment_loss_tol or 0.0)
+        self.joint_loss_tol = float(joint_loss_tol or 0.0)
+        self.early_stop_patience = int(early_stop_patience or 0)
+        self.early_stop_min_delta = float(early_stop_min_delta or 0.0)
+        self.checkpoint_dir = checkpoint_dir
         # active_layer_frac 是每个网格单元的活动层分级比例 p_k。
         # 初始值来自 Excel 主河道级配，后续按 morph_dt 用 Exner 床变速率显式更新。
         self.active_layer_frac = self._init_gradation(initial_gradation)
@@ -159,7 +177,49 @@ class DecoupledTrainer:
             'p_min_diag': [],
             'p_max_diag': [],
             'wall_un_abs_mean': [],
+            'stop_reason': {},
         }
+
+    def save_checkpoint(self, name):
+        """保存阶段 checkpoint，长训练中断后至少保留已完成阶段结果。"""
+        if not self.checkpoint_dir:
+            return
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        path = os.path.join(self.checkpoint_dir, f'{name}.pt')
+        payload = {
+            'flow_model': self.flow_model.state_dict(),
+            'sediment_model': self.sediment_model.state_dict() if self.sediment_model is not None else None,
+            'flow_optimizer': self.flow_optimizer.state_dict(),
+            'sediment_optimizer': (
+                self.sediment_optimizer.state_dict()
+                if self.sediment_optimizer is not None else None
+            ),
+            'joint_optimizer': (
+                self.joint_optimizer.state_dict()
+                if self.joint_optimizer is not None else None
+            ),
+            'active_layer_frac': self.active_layer_frac,
+            'history': self.history,
+            'simulation_time': self.simulation_time,
+        }
+        torch.save(payload, path)
+        print(f"  checkpoint saved: {path}")
+
+    def _early_stop_check(self, phase, epoch, loss_value, best_loss, stale_epochs, loss_tol):
+        """检查单阶段训练是否满足提前停止条件。"""
+        if loss_tol > 0.0 and loss_value <= loss_tol:
+            return best_loss, stale_epochs, f"{phase}: loss {loss_value:.3e} <= tol {loss_tol:.3e}"
+
+        if best_loss is None or (best_loss - loss_value) > self.early_stop_min_delta:
+            return loss_value, 0, None
+
+        stale_epochs += 1
+        if self.early_stop_patience > 0 and stale_epochs >= self.early_stop_patience:
+            return best_loss, stale_epochs, (
+                f"{phase}: no improvement > {self.early_stop_min_delta:.3e} "
+                f"for {self.early_stop_patience} epoch(s)"
+            )
+        return best_loss, stale_epochs, None
 
     def _init_gradation(self, initial_gradation):
         """用 Excel 级配初始化活动层；如果未提供，则退化为均匀级配。"""
@@ -233,6 +293,9 @@ class DecoupledTrainer:
         self.flow_model.train()
         total_loss_value = 0.0
         progress = _ProgressBar('Flow PINN', n_epochs * len(time_list))
+        best_loss = None
+        stale_epochs = 0
+        stop_reason = None
         for epoch in range(n_epochs):
             self.flow_optimizer.zero_grad()
             total_loss_value = 0.0
@@ -255,7 +318,17 @@ class DecoupledTrainer:
             self.history['continuity'].append(loss_acc['continuity'])
             self.history['momentum_x'].append(loss_acc['momentum_x'])
             self.history['momentum_y'].append(loss_acc['momentum_y'])
-        progress.close(loss=total_loss_value)
+            best_loss, stale_epochs, stop_reason = self._early_stop_check(
+                'flow', epoch, total_loss_value, best_loss, stale_epochs, self.flow_loss_tol
+            )
+            if stop_reason is not None:
+                self.history['stop_reason']['flow'] = stop_reason
+                break
+        if stop_reason is None:
+            progress.close(loss=total_loss_value)
+        else:
+            progress.finish(loss=total_loss_value)
+            print(f"  Early stop: {stop_reason}")
         return total_loss_value
 
     def train_sediment_phase(self, n_epochs, T_norm, freeze_flow_params=True):
@@ -271,6 +344,9 @@ class DecoupledTrainer:
         cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
         total_loss_value = 0.0
         progress = _ProgressBar('Sediment PINN', n_epochs * len(time_list) * len(cell_batches))
+        best_loss = None
+        stale_epochs = 0
+        stop_reason = None
 
         for epoch in range(n_epochs):
             total_loss_value = 0.0
@@ -351,7 +427,17 @@ class DecoupledTrainer:
                 self.history['dzb_min'].append(loss_acc['dzb_min'])
                 self.history['dzb_max'].append(loss_acc['dzb_max'])
                 self.history['Ceq_mean'].append(loss_acc['Ceq_mean'])
-        progress.close(loss=total_loss_value)
+            best_loss, stale_epochs, stop_reason = self._early_stop_check(
+                'sediment', epoch, total_loss_value, best_loss, stale_epochs, self.sediment_loss_tol
+            )
+            if stop_reason is not None:
+                self.history['stop_reason']['sediment'] = stop_reason
+                break
+        if stop_reason is None:
+            progress.close(loss=total_loss_value)
+        else:
+            progress.finish(loss=total_loss_value)
+            print(f"  Early stop: {stop_reason}")
         return total_loss_value
 
     def train_joint_phase(self, n_epochs, T_norm, data_coords=None):
@@ -360,7 +446,7 @@ class DecoupledTrainer:
         联合阶段不再冻结 flow_model，因此泥沙 loss 中的梯度也可以反馈到 h/u/v。
         这一步用于修正“先水后沙”分阶段训练造成的弱耦合误差。
         """
-        if self.sediment_model is None or self.joint_optimizer is None:
+        if n_epochs <= 0 or self.sediment_model is None or self.joint_optimizer is None:
             return 0.0
 
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
@@ -368,6 +454,9 @@ class DecoupledTrainer:
         cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
         total_loss_value = 0.0
         progress = _ProgressBar('Joint PINN', max(n_epochs, 0) * len(time_list) * (1 + len(cell_batches)))
+        best_loss = None
+        stale_epochs = 0
+        stop_reason = None
 
         for epoch in range(n_epochs):
             self.flow_model.train()
@@ -407,8 +496,18 @@ class DecoupledTrainer:
             if self.joint_scheduler is not None:
                 self.joint_scheduler.step(total_loss_value)
             self.history['joint_loss'].append(total_loss_value)
+            best_loss, stale_epochs, stop_reason = self._early_stop_check(
+                'joint', epoch, total_loss_value, best_loss, stale_epochs, self.joint_loss_tol
+            )
+            if stop_reason is not None:
+                self.history['stop_reason']['joint'] = stop_reason
+                break
 
-        progress.close(loss=total_loss_value)
+        if stop_reason is None:
+            progress.close(loss=total_loss_value)
+        else:
+            progress.finish(loss=total_loss_value)
+            print(f"  Early stop: {stop_reason}")
         return total_loss_value
 
     def _compute_real_flow_boundary_loss(self, payload):
@@ -763,6 +862,7 @@ class DecoupledTrainer:
         if verbose:
             print(f'阶段 1 完成: Flow Loss={flow_loss:.2e}')
             print('\n阶段 2/3: 冻结水动力，训练泥沙 PINN 和累计床变 Δzb')
+        self.save_checkpoint('phase1_flow')
 
         sediment_loss = self.train_sediment_phase(
             sediment_epochs,
@@ -773,9 +873,11 @@ class DecoupledTrainer:
         if verbose:
             print(f'阶段 2 完成: Sediment Loss={sediment_loss:.2e}')
             print('\n阶段 3/3: 联合优化水动力 PINN 和泥沙 PINN')
+        self.save_checkpoint('phase2_sediment')
 
         joint_epochs = int(getattr(self, 'joint_epochs', 0))
         joint_loss = self.train_joint_phase(joint_epochs, T_norm_list, data_coords=bc_builder)
+        self.save_checkpoint('phase3_joint')
 
         # 训练完成后再统一生成床面历史、更新级配历史和记录诊断。
         # 目前床面历史来自网络预测 Δzb；级配更新是后处理式显式更新。

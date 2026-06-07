@@ -1,4 +1,9 @@
 
+import json
+import os
+import shutil
+
+import numpy as np
 import torch
 
 from src.config import load_config
@@ -24,6 +29,9 @@ def run_real_case(config_path="config.yaml"):
     """
     # 1. 加载配置 
     cfg = load_config(config_path)
+    output_dir = cfg.training.get('output_dir', 'outputs')
+    checkpoint_dir = cfg.training.get('checkpoint_dir', os.path.join(output_dir, 'checkpoints'))
+    os.makedirs(output_dir, exist_ok=True)
 
     # 2. 读取真实 DEM、边界过程线和床沙级配；网格范围和分辨率由 DEM 决定。
     real_case = load_real_case_data(cfg.data)
@@ -40,6 +48,14 @@ def run_real_case(config_path="config.yaml"):
         f"Hydrograph: Q={len(real_case.flow_times)} points, "
         f"stage={len(real_case.stage_times)} points, "
         f"gradation={len(real_case.grain_diameters)} classes"
+    )
+    print(
+        "Training settings: "
+        f"flow_epochs={cfg.training['flow_epochs']}, "
+        f"sediment_epochs={cfg.training['sediment_epochs']}, "
+        f"joint_epochs={cfg.training['joint_epochs']}, "
+        f"sediment_batch={cfg.training.get('sediment_cell_batch_size', 1024)}, "
+        f"output_dir={output_dir}"
     )
 
     mesh = FVMeshPreprocessor(
@@ -133,6 +149,12 @@ def run_real_case(config_path="config.yaml"):
         flow_lr=cfg.training.get('flow_lr', 1e-4),
         transport_lr=cfg.training.get('transport_lr', 1e-4),
         sediment_cell_batch_size=cfg.training.get('sediment_cell_batch_size', 1024),
+        flow_loss_tol=cfg.training.get('flow_loss_tol', 0.0),
+        sediment_loss_tol=cfg.training.get('sediment_loss_tol', 0.0),
+        joint_loss_tol=cfg.training.get('joint_loss_tol', 0.0),
+        early_stop_patience=cfg.training.get('early_stop_patience', 0),
+        early_stop_min_delta=cfg.training.get('early_stop_min_delta', 0.0),
+        checkpoint_dir=checkpoint_dir,
     )
 
     # 7. 真实边界条件：
@@ -162,7 +184,17 @@ def run_real_case(config_path="config.yaml"):
         joint_epochs=cfg.training['joint_epochs'],
     )
 
-    # 9. 可视化结果 
+    # 9. 保存正式训练产物：模型、床面历史、级配、history 和配置快照。
+    save_training_outputs(
+        output_dir=output_dir,
+        config_path=config_path,
+        flow_model=flow_model,
+        sediment_model=sediment_model,
+        trainer=trainer,
+        bed_history=bed_history,
+    )
+
+    # 10. 可视化结果 
     visualize_results(
         mesh=mesh,
         bed_history=bed_history,
@@ -171,10 +203,54 @@ def run_real_case(config_path="config.yaml"):
         history=trainer.history,
         simulation_time=cfg.simulation_time,
         case_name='real',
-        output_dir='outputs',
+        output_dir=output_dir,
     )
 
     return bed_history, trainer.history
+
+
+def save_training_outputs(output_dir, config_path, flow_model, sediment_model, trainer, bed_history):
+    """保存正式训练结果，便于后处理、复现实验和中断恢复。"""
+    os.makedirs(output_dir, exist_ok=True)
+    torch.save(flow_model.state_dict(), os.path.join(output_dir, 'flow_model.pt'))
+    torch.save(sediment_model.state_dict(), os.path.join(output_dir, 'sediment_model.pt'))
+    torch.save(
+        {
+            'flow_model': flow_model.state_dict(),
+            'sediment_model': sediment_model.state_dict(),
+            'active_layer_frac': trainer.active_layer_frac,
+            'history': trainer.history,
+            'simulation_time': trainer.simulation_time,
+        },
+        os.path.join(output_dir, 'final_checkpoint.pt'),
+    )
+    np.savez_compressed(
+        os.path.join(output_dir, 'training_results.npz'),
+        bed_history=np.asarray(bed_history, dtype=np.float32),
+        active_layer_frac=np.asarray(trainer.active_layer_frac, dtype=np.float32),
+        output_times=np.asarray(trainer.history.get('output_times', []), dtype=np.float32),
+        morph_times=np.asarray(trainer.history.get('morph_times', []), dtype=np.float32),
+    )
+    with open(os.path.join(output_dir, 'history.json'), 'w', encoding='utf-8') as f:
+        json.dump(_json_safe(trainer.history), f, ensure_ascii=False, indent=2)
+    if config_path and os.path.exists(config_path):
+        shutil.copyfile(config_path, os.path.join(output_dir, 'config_used.yaml'))
+    print(f"训练结果已保存到: {output_dir}")
+
+
+def _json_safe(value):
+    """把 NumPy/PyTorch 标量递归转成 JSON 可写对象。"""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    return value
 
 
 def _match_concentration(values, n_grains):

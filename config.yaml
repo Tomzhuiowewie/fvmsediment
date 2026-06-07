@@ -6,7 +6,7 @@ data:
   outlet_edge: bottom
 
 fvm:
-  n_gauss_points: 2  # 真实 DEM 网格较大；先用 1 点高斯积分降低显存占用
+  n_gauss_points: 1  # 真实 DEM 网格较大；正式训练先用 1 点高斯积分保证显存稳定
 
 physics:
   include_time_terms: true
@@ -48,10 +48,17 @@ physics:
     bed_slope_diffusion_weight: 1.0
 
 training:
-  flow_epochs: 10
-  sediment_epochs: 20
-  joint_epochs: 20
+  flow_epochs: 200
+  sediment_epochs: 100
+  joint_epochs: 50
+  flow_loss_tol: 0.0  # >0 时，水动力 loss 低于该值提前停止
+  sediment_loss_tol: 0.0  # >0 时，泥沙 loss 低于该值提前停止
+  joint_loss_tol: 0.0  # >0 时，联合 loss 低于该值提前停止
+  early_stop_patience: 30  # 连续若干 epoch 改善不足则提前停止
+  early_stop_min_delta: 0.000001  # 判断 loss 有效改善的最小幅度
   sediment_cell_batch_size: 1024  # 泥沙分粒径自动微分显存占用大，按河道单元分批训练
-  flow_lr: 0.001
-  transport_lr: 0.001
+  flow_lr: 0.0005
+  transport_lr: 0.0005
   w_bed_change: 1.0
+  output_dir: outputs
+  checkpoint_dir: outputs/checkpoints
