@@ -175,10 +175,10 @@ class DecoupledTrainer:
         """
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         self.flow_model.train()
-        total_loss = torch.tensor(0.0, device=self.device)
+        total_loss_value = 0.0
         for epoch in range(n_epochs):
             self.flow_optimizer.zero_grad()
-            total_loss = torch.tensor(0.0, device=self.device)
+            total_loss_value = 0.0
             loss_acc = {'continuity': 0.0, 'momentum_x': 0.0, 'momentum_y': 0.0}
             for t_i in time_list:
                 # 水动力阶段：浅水方程残差 + 真实边界（入口流量、出口水位）约束。
@@ -186,18 +186,18 @@ class DecoupledTrainer:
                 boundary_loss = self._compute_real_flow_boundary_loss(bc_builder(t_i))
                 # 边界 loss 权重先固定为 0.5；后续如果 Q 或 stage 偏差大，可单独配置。
                 step_loss = physics_loss + 0.5 * boundary_loss
-                total_loss = total_loss + step_loss / len(time_list)
+                (step_loss / len(time_list)).backward()
+                total_loss_value += float(step_loss.detach().cpu()) / len(time_list)
                 for key in loss_acc:
                     loss_acc[key] += loss_dict[key] / len(time_list)
-            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.flow_model.parameters(), max_norm=1.0)
             self.flow_optimizer.step()
-            self.flow_scheduler.step(total_loss.detach())
-            self.history['flow_loss'].append(total_loss.item())
+            self.flow_scheduler.step(total_loss_value)
+            self.history['flow_loss'].append(total_loss_value)
             self.history['continuity'].append(loss_acc['continuity'])
             self.history['momentum_x'].append(loss_acc['momentum_x'])
             self.history['momentum_y'].append(loss_acc['momentum_y'])
-        return total_loss.item()
+        return total_loss_value
 
     def train_sediment_phase(self, n_epochs, T_norm, freeze_flow_params=True):
         """阶段 2：训练泥沙 PINN。
@@ -209,9 +209,10 @@ class DecoupledTrainer:
         self.flow_model.eval()
         # 当前活动层级配会影响输沙能力闭合，因此每个训练阶段开始时映射到高斯点。
         p_k_gauss = self._gradation_at_gauss_tensor()
-        total_loss = torch.tensor(0.0, device=self.device)
+        total_loss_value = 0.0
 
         for epoch in range(n_epochs):
+            total_loss_value = 0.0
             loss_acc = {
                 'transport': 0.0,
                 'capacity': 0.0,
@@ -229,7 +230,6 @@ class DecoupledTrainer:
                 self.sediment_model.train()
 
                 self.sediment_optimizer.zero_grad()
-                total_loss = torch.tensor(0.0, device=self.device)
                 for t_i in time_list:
                     # compute_sediment_loss 内部包含：
                     # 输沙 PDE 残差、C≈C_capacity、入口平衡浓度、Δzb 的 Exner 约束。
@@ -238,7 +238,8 @@ class DecoupledTrainer:
                         p_k_override=p_k_gauss,
                         freeze_flow_params=freeze_flow_params,
                     )
-                    total_loss = total_loss + sediment_loss / len(time_list)
+                    (sediment_loss / len(time_list)).backward()
+                    total_loss_value += float(sediment_loss.detach().cpu()) / len(time_list)
                     loss_acc['transport'] += sediment_dict['transport'] / len(time_list)
                     loss_acc['capacity'] += sediment_dict['capacity'] / len(time_list)
                     loss_acc['initial'] += sediment_dict['initial'] / len(time_list)
@@ -267,13 +268,12 @@ class DecoupledTrainer:
                         else max(loss_acc['dzb_max'], sediment_dict['dzb_max'])
                     )
 
-                total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.sediment_model.parameters(), max_norm=1.0)
                 self.sediment_optimizer.step()
                 if self.sediment_scheduler is not None:
-                    self.sediment_scheduler.step(total_loss.detach())
+                    self.sediment_scheduler.step(total_loss_value)
 
-            self.history['sediment_loss'].append(total_loss.item())
+            self.history['sediment_loss'].append(total_loss_value)
             if loss_acc['C_min'] is not None:
                 self.history['transport_loss'].append(loss_acc['transport'])
                 self.history['capacity_loss'].append(loss_acc['capacity'])
@@ -286,7 +286,7 @@ class DecoupledTrainer:
                 self.history['dzb_min'].append(loss_acc['dzb_min'])
                 self.history['dzb_max'].append(loss_acc['dzb_max'])
                 self.history['Ceq_mean'].append(loss_acc['Ceq_mean'])
-        return total_loss.item()
+        return total_loss_value
 
     def train_joint_phase(self, n_epochs, T_norm, data_coords=None):
         """阶段 3：联合优化水动力和泥沙网络。
@@ -299,13 +299,13 @@ class DecoupledTrainer:
 
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         p_k_gauss = self._gradation_at_gauss_tensor()
-        total_loss = torch.tensor(0.0, device=self.device)
+        total_loss_value = 0.0
 
         for epoch in range(n_epochs):
             self.flow_model.train()
             self.sediment_model.train()
             self.joint_optimizer.zero_grad()
-            total_loss = torch.tensor(0.0, device=self.device)
+            total_loss_value = 0.0
 
             for t_i in time_list:
                 # 联合 loss = 水动力方程/边界 + 泥沙方程/床变约束。
@@ -320,19 +320,20 @@ class DecoupledTrainer:
                     p_k_override=p_k_gauss,
                     freeze_flow_params=False,
                 )
-                total_loss = total_loss + (flow_loss + sediment_loss) / len(time_list)
+                step_loss = flow_loss + sediment_loss
+                (step_loss / len(time_list)).backward()
+                total_loss_value += float(step_loss.detach().cpu()) / len(time_list)
 
-            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(self.flow_model.parameters()) + list(self.sediment_model.parameters()),
                 max_norm=1.0,
             )
             self.joint_optimizer.step()
             if self.joint_scheduler is not None:
-                self.joint_scheduler.step(total_loss.detach())
-            self.history['joint_loss'].append(total_loss.item())
+                self.joint_scheduler.step(total_loss_value)
+            self.history['joint_loss'].append(total_loss_value)
 
-        return total_loss.item()
+        return total_loss_value
 
     def _compute_real_flow_boundary_loss(self, payload):
         """真实边界损失：入口总流量、出口水位、侧壁 no-flux。"""

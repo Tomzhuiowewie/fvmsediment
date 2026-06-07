@@ -6,7 +6,7 @@ data:
   outlet_edge: bottom
 
 fvm:
-  n_gauss_points: 2
+  n_gauss_points: 2  # 真实 DEM 网格较大；先用 1 点高斯积分降低显存占用
 
 physics:
   include_time_terms: true

@@ -120,9 +120,23 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
             loss_dict: 各分项损失值字典
         """
         self._ensure_tensors(device)
-        gauss_coords = self._gauss_coords_t
-        gauss_normals = self._gauss_normals_t
-        gauss_weights = self._gauss_weights_t
+        npp = self.mesh.n_points_per_cell
+        active_cell_ids_np = np.where(
+            getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
+        )[0]
+        if active_cell_ids_np.size == 0:
+            active_cell_ids_np = np.arange(self.mesh.n_cells)
+        gauss_ids_np = (
+            active_cell_ids_np[:, None] * npp
+            + np.arange(npp, dtype=np.int64)[None, :]
+        ).reshape(-1)
+        active_cell_ids = torch.as_tensor(active_cell_ids_np, dtype=torch.long, device=device)
+        gauss_ids = torch.as_tensor(gauss_ids_np, dtype=torch.long, device=device)
+
+        # 只在 DEM 河道 active 单元上构建自动微分图，避免把整个矩形 DEM 域放进显存。
+        gauss_coords = self._gauss_coords_t[gauss_ids]
+        gauss_normals = self._gauss_normals_t[gauss_ids]
+        gauss_weights = self._gauss_weights_t[gauss_ids]
 
         # 构建输入并前向推理
         xyt = build_xyt(
@@ -135,8 +149,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         # 几何量准备
         nx = gauss_normals[:, 0:1]  # x方向法向量分量，形状 [N, 1]
         ny = gauss_normals[:, 1:2]  # y方向法向量分量
-        Nc = self.mesh.n_cells
-        npp = self.mesh.n_points_per_cell
+        Nc = int(active_cell_ids_np.size)
         weights_r = gauss_weights.view(Nc, npp)
         # 重塑为单元-点结构
         h_r = h.view(Nc, npp)
@@ -157,10 +170,12 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         flux_h = (h * u) * nx + (h * v) * ny
         bnd_h = torch.sum(flux_h.view(Nc, npp) * weights_r, dim=1, keepdim=True)
         cont_res = (vol_h + bnd_h) * self.continuity_scale
-        loss_continuity = self._masked_cell_mean(cont_res ** 2)
+        loss_continuity = torch.mean(cont_res ** 2)
 
         # ② 床面坡度源项：S = -g·h·∇zb·A
         dzb_dx_t, dzb_dy_t = self.mesh.get_bed_gradient(device)
+        dzb_dx_t = dzb_dx_t[active_cell_ids]
+        dzb_dy_t = dzb_dy_t[active_cell_ids]
         slope_x = -self.g * h_cell * dzb_dx_t.unsqueeze(1) * self.mesh.cell_area
         slope_y = -self.g * h_cell * dzb_dy_t.unsqueeze(1) * self.mesh.cell_area
 
@@ -186,7 +201,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         )
         vol_mx = hu_t_cell * self.mesh.cell_area
         mom_x_res = (vol_mx + bnd_mx - slope_x + fric_tx) * self.momentum_scale
-        loss_momentum_x = self._masked_cell_mean(mom_x_res ** 2)
+        loss_momentum_x = torch.mean(mom_x_res ** 2)
 
         # ⑤ y 方向动量方程
         flux_my = (h * v * u) * nx + (h * v * v + 0.5 * self.g * h * h) * ny
@@ -198,7 +213,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         )
         vol_my = hv_t_cell * self.mesh.cell_area
         mom_y_res = (vol_my + bnd_my - slope_y + fric_ty) * self.momentum_scale
-        loss_momentum_y = self._masked_cell_mean(mom_y_res ** 2)
+        loss_momentum_y = torch.mean(mom_y_res ** 2)
 
         total_loss = loss_continuity + loss_momentum_x + loss_momentum_y
         loss_dict = {
