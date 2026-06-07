@@ -335,7 +335,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
             raise ValueError("dim must be 0 or 1 for physical-space gradients.")
         return grad / max(scale, EPS_DIVISION)
 
-    def total_load_fvm_loss(self, xyt, h, u, v, C_tk, beta_tk, epsilon_thk, E_tk, D_tk):
+    def total_load_fvm_loss(self, xyt, h, u, v, C_tk, beta_tk, epsilon_thk, E_tk, D_tk, closure=None):
         """总输沙方程有限体积残差。
 
         Integral form:
@@ -343,13 +343,18 @@ class SedimentTransportLoss(_CachedMeshTensors):
             - ∮ diffusive_flux dS - ∫(E-D)dA = 0
         """
         self._ensure_tensors(C_tk.device)
-        Nc = self.mesh.n_cells
         npp = self.mesh.n_points_per_cell
+        Nc = int(closure['n_cells']) if closure is not None else self.mesh.n_cells
         K = C_tk.shape[1]
 
-        weights = self._gauss_weights_t.view(Nc, npp, 1)
-        nx = self._gauss_normals_t[:, 0:1]
-        ny = self._gauss_normals_t[:, 1:2]
+        if closure is None:
+            weights = self._gauss_weights_t.view(Nc, npp, 1)
+            normals = self._gauss_normals_t
+        else:
+            weights = closure['gauss_weights'].view(Nc, npp, 1)
+            normals = closure['gauss_normals']
+        nx = normals[:, 0:1]
+        ny = normals[:, 1:2]
 
         beta_safe = torch.clamp(beta_tk, min=EPS_DIVISION)
         # 输沙存储项：storage = h * C_tk / beta_tk，包含输沙修正系数 beta_tk
@@ -369,11 +374,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
         volume_source = torch.mean(source.view(Nc, npp, K), dim=1) * self.mesh.cell_area
         # 总残差 = 存储项 + 对流项 - 扩散项 - 源汇项，平方后平均得到损失值
         residual = volume_storage + boundary_advection - boundary_diffusion - volume_source
-        cell_mask = self._active_cell_mask_t.view(Nc, 1)
-        loss = torch.sum((residual * self.residual_scale) ** 2 * cell_mask) / torch.clamp(
-            torch.sum(cell_mask) * K,
-            min=1.0,
-        )
+        loss = torch.mean((residual * self.residual_scale) ** 2)
         return loss, residual
 
     # 统一闭合计算
@@ -386,6 +387,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
         device,
         p_k_override=None,
         freeze_flow_params=True,
+        cell_indices=None,
     ):
         """计算所有中间物理量，供输沙 PDE、Exner 方程和级配方程共用。
 
@@ -393,8 +395,24 @@ class SedimentTransportLoss(_CachedMeshTensors):
         E_tk, D_tk, C_capacity, vel_mag。
         """
         self._ensure_tensors(device)
+        npp = self.mesh.n_points_per_cell
+        if cell_indices is None:
+            cell_ids_np = np.where(
+                getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
+            )[0]
+        else:
+            cell_ids_np = np.asarray(cell_indices, dtype=np.int64)
+        if cell_ids_np.size == 0:
+            cell_ids_np = np.arange(self.mesh.n_cells, dtype=np.int64)
+        gauss_ids_np = (
+            cell_ids_np[:, None] * npp
+            + np.arange(npp, dtype=np.int64)[None, :]
+        ).reshape(-1)
+        cell_ids_t = torch.as_tensor(cell_ids_np, dtype=torch.long, device=device)
+        gauss_ids_t = torch.as_tensor(gauss_ids_np, dtype=torch.long, device=device)
+
         xyt = build_xyt(
-            self._gauss_coords_t, T_norm, self.bounds,
+            self._gauss_coords_t[gauss_ids_t], T_norm, self.bounds,
             device, requires_grad=True,
         )
 
@@ -427,7 +445,10 @@ class SedimentTransportLoss(_CachedMeshTensors):
         
         # 级配
         if p_k_override is not None:
-            p_k = match_closure(p_k_override, C_tk, 1.0 / C_tk.shape[1])
+            p_source = p_k_override
+            if torch.is_tensor(p_source) and p_source.shape[0] == self.mesh.n_gauss_total:
+                p_source = p_source[gauss_ids_t]
+            p_k = match_closure(p_source, C_tk, 1.0 / C_tk.shape[1])
         else:
             p_k = torch.ones_like(C_tk) / C_tk.shape[1]
 
@@ -458,6 +479,11 @@ class SedimentTransportLoss(_CachedMeshTensors):
             'tau_skin': wu_diag['tau_skin'],
             'tau_cr': wu_diag['tau_cr'],
             'fall_velocity': wu_diag['ws'],
+            'cell_ids': cell_ids_t,
+            'gauss_ids': gauss_ids_t,
+            'n_cells': int(cell_ids_np.size),
+            'gauss_normals': self._gauss_normals_t[gauss_ids_t],
+            'gauss_weights': self._gauss_weights_t[gauss_ids_t],
         }
 
     def exner_dzb_dt_gauss(self, closure):
@@ -467,12 +493,13 @@ class SedimentTransportLoss(_CachedMeshTensors):
         d(Δzb)/dt 应接近 Exner 预测的床变速率。
         """
         dzb_dt_k_cell = self.exner_dzb_dt_k_cell(closure)
-        gauss_cell_id = torch.as_tensor(
-            self.mesh.gauss_cell_id,
+        npp = self.mesh.n_points_per_cell
+        local_gauss_cell_id = torch.arange(
+            closure['n_cells'],
             dtype=torch.long,
             device=closure['C_tk'].device,
-        )
-        return torch.sum(dzb_dt_k_cell, dim=1, keepdim=True)[gauss_cell_id]
+        ).repeat_interleave(npp)
+        return torch.sum(dzb_dt_k_cell, dim=1, keepdim=True)[local_gauss_cell_id]
 
     def exner_dzb_dt_k_cell(self, closure):
         """返回每个单元、每个粒径组的 Exner 床变速率 dzb_dt_k。
@@ -480,25 +507,28 @@ class SedimentTransportLoss(_CachedMeshTensors):
         正值表示该粒径组对河床有淤积贡献，负值表示冲刷贡献。
         """
         npp = self.mesh.n_points_per_cell
-        nc = self.mesh.n_cells
+        nc = int(closure.get('n_cells', self.mesh.n_cells))
         n_grains = closure['E_tk'].shape[1]
 
         net_deposition_rate = (
             closure['D_tk'] - closure['E_tk']
         ).view(nc, npp, n_grains).mean(dim=1)
 
-        weights = self._gauss_weights_t.view(nc, npp, 1)
-        nx = self._gauss_normals_t[:, 0:1]
-        ny = self._gauss_normals_t[:, 1:2]
+        weights = closure.get('gauss_weights', self._gauss_weights_t).view(nc, npp, 1)
+        normals = closure.get('gauss_normals', self._gauss_normals_t)
+        nx = normals[:, 0:1]
+        ny = normals[:, 1:2]
 
         dzb_dx_cell, dzb_dy_cell = self.mesh.get_bed_gradient(closure['C_tk'].device)
-        gauss_cell_id = torch.as_tensor(
-            self.mesh.gauss_cell_id,
-            dtype=torch.long,
-            device=closure['C_tk'].device,
+        cell_ids = closure.get(
+            'cell_ids',
+            torch.arange(self.mesh.n_cells, dtype=torch.long, device=closure['C_tk'].device),
         )
-        dzb_dx = dzb_dx_cell[gauss_cell_id].view(nc * npp, 1)
-        dzb_dy = dzb_dy_cell[gauss_cell_id].view(nc * npp, 1)
+        dzb_dx_local = dzb_dx_cell[cell_ids]
+        dzb_dy_local = dzb_dy_cell[cell_ids]
+        local_gauss_cell_id = torch.arange(nc, dtype=torch.long, device=closure['C_tk'].device).repeat_interleave(npp)
+        dzb_dx = dzb_dx_local[local_gauss_cell_id].view(nc * npp, 1)
+        dzb_dy = dzb_dy_local[local_gauss_cell_id].view(nc * npp, 1)
         bed_slope_normal = dzb_dx * nx + dzb_dy * ny
 
         tau_skin = torch.clamp(closure['tau_skin'], min=EPS_DIVISION)
@@ -529,6 +559,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
         device,
         p_k_override=None,
         freeze_flow_params=True,
+        cell_indices=None,
     ):
         """计算泥沙网络损失。
 
@@ -543,6 +574,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
             sediment_model, flow_model, T_norm, device,
             p_k_override=p_k_override,
             freeze_flow_params=freeze_flow_params,
+            cell_indices=cell_indices,
         )
         xyt     = closure['xyt']
         h, u, v = closure['h'], closure['u'], closure['v']
@@ -556,25 +588,26 @@ class SedimentTransportLoss(_CachedMeshTensors):
         transport_loss, residual = self.total_load_fvm_loss(
             xyt, h, u, v, C_tk,
             closure['beta_tk'], closure['epsilon_thk'], E_tk, D_tk,
+            closure=closure,
         )
 
         # 容量闭合：C_capacity 只作为目标，不让该项反向拉动水动力闭合公式。
-        capacity_loss = self._masked_gauss_mean((C_tk - C_capacity.detach()) ** 2)
+        capacity_loss = torch.mean((C_tk - C_capacity.detach()) ** 2)
 
         # 初始条件只在 t=0 生效，避免把所有时刻都压到初始浓度。
         initial_loss = self.initial_condition_loss(C_tk) if abs(float(T_norm)) < 1.0e-8 else torch.zeros_like(capacity_loss)
 
         # 上游泥沙入口采用“平衡来沙”假设，不再指定固定浓度。
-        inlet_loss = self.inlet_equilibrium_loss(C_tk, C_capacity)
+        inlet_loss = self.inlet_equilibrium_loss(C_tk, C_capacity, closure)
 
         # Δzb 是网络的累计床变输出；其时间导数应符合 Exner 方程给出的床变速率。
         dzb_t = self._dt(dzb_pred, xyt)
         exner_dzb_dt = self.exner_dzb_dt_gauss(closure)
-        bed_change_loss = self._masked_gauss_mean((dzb_t - exner_dzb_dt) ** 2)
+        bed_change_loss = torch.mean((dzb_t - exner_dzb_dt) ** 2)
 
         # t=0 时累计床变应为 0。
         bed_initial_loss = (
-            self._masked_gauss_mean(dzb_pred ** 2)
+            torch.mean(dzb_pred ** 2)
             if abs(float(T_norm)) < 1.0e-8
             else torch.zeros_like(bed_change_loss)
         )
@@ -616,7 +649,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
             raise ValueError("初始泥沙浓度维度必须与泥沙粒径组数量一致。")
         return torch.mean((C_tk - target.expand_as(C_tk)) ** 2)
 
-    def inlet_equilibrium_loss(self, C_tk, C_capacity):
+    def inlet_equilibrium_loss(self, C_tk, C_capacity, closure=None):
         """上游入口泥沙边界：入口浓度接近当前水流输沙能力。
 
         真实算例入口在 DEM 活动河道最上方，水动力入口用总流量约束；
@@ -624,6 +657,8 @@ class SedimentTransportLoss(_CachedMeshTensors):
         人为强冲刷。
         """
         inlet_mask = self._top_active_edge_mask(C_tk.device)
+        if closure is not None and 'gauss_ids' in closure:
+            inlet_mask = inlet_mask[closure['gauss_ids']]
         if not torch.any(inlet_mask):
             return torch.zeros((), dtype=C_tk.dtype, device=C_tk.device)
         return torch.mean((C_tk[inlet_mask] - C_capacity[inlet_mask].detach()) ** 2)

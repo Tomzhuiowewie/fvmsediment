@@ -132,6 +132,7 @@ def run_real_case(config_path="config.yaml"):
         active_layer_thickness=cfg.active_layer_thickness,
         flow_lr=cfg.training.get('flow_lr', 1e-4),
         transport_lr=cfg.training.get('transport_lr', 1e-4),
+        sediment_cell_batch_size=cfg.training.get('sediment_cell_batch_size', 1024),
     )
 
     # 7. 真实边界条件：

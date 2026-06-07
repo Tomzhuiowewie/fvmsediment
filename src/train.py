@@ -31,6 +31,7 @@ class DecoupledTrainer:
         active_layer_thickness=0.5,
         flow_lr=1e-4,
         transport_lr=1e-4,
+        sediment_cell_batch_size=1024,
     ):
         self.flow_model = flow_model
         self.sediment_model = sediment_model
@@ -40,6 +41,7 @@ class DecoupledTrainer:
         self.sediment_transport_loss_fn = sediment_transport_loss_fn
         self.simulation_time = simulation_time
         self.active_layer_thickness = float(active_layer_thickness)
+        self.sediment_cell_batch_size = int(sediment_cell_batch_size)
         # active_layer_frac 是每个网格单元的活动层分级比例 p_k。
         # 初始值来自 Excel 主河道级配，后续按 morph_dt 用 Exner 床变速率显式更新。
         self.active_layer_frac = self._init_gradation(initial_gradation)
@@ -130,6 +132,13 @@ class DecoupledTrainer:
         p_gauss = self.active_layer_frac[self.mesh.gauss_cell_id]
         return torch.tensor(p_gauss, dtype=torch.float32, device=self.device)
 
+    def _active_cell_batches(self, batch_size):
+        """把河道 active 单元切成小批，降低泥沙自动微分显存占用。"""
+        active = np.where(getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool)))[0]
+        if batch_size is None or batch_size <= 0 or batch_size >= active.size:
+            return [active]
+        return [active[i:i + batch_size] for i in range(0, active.size, batch_size)]
+
     def _build_wall_gauss_mask(self):
         """识别固壁边界高斯点。
 
@@ -209,6 +218,7 @@ class DecoupledTrainer:
         self.flow_model.eval()
         # 当前活动层级配会影响输沙能力闭合，因此每个训练阶段开始时映射到高斯点。
         p_k_gauss = self._gradation_at_gauss_tensor()
+        cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
         total_loss_value = 0.0
 
         for epoch in range(n_epochs):
@@ -231,42 +241,45 @@ class DecoupledTrainer:
 
                 self.sediment_optimizer.zero_grad()
                 for t_i in time_list:
-                    # compute_sediment_loss 内部包含：
-                    # 输沙 PDE 残差、C≈C_capacity、入口平衡浓度、Δzb 的 Exner 约束。
-                    sediment_loss, sediment_dict = self.sediment_transport_loss_fn.compute_sediment_loss(
-                        self.sediment_model, self.flow_model, t_i, self.device,
-                        p_k_override=p_k_gauss,
-                        freeze_flow_params=freeze_flow_params,
-                    )
-                    (sediment_loss / len(time_list)).backward()
-                    total_loss_value += float(sediment_loss.detach().cpu()) / len(time_list)
-                    loss_acc['transport'] += sediment_dict['transport'] / len(time_list)
-                    loss_acc['capacity'] += sediment_dict['capacity'] / len(time_list)
-                    loss_acc['initial'] += sediment_dict['initial'] / len(time_list)
-                    loss_acc['inlet'] += sediment_dict['inlet'] / len(time_list)
-                    loss_acc['bed_change'] += sediment_dict['bed_change'] / len(time_list)
-                    loss_acc['bed_initial'] += sediment_dict['bed_initial'] / len(time_list)
-                    loss_acc['Ceq_mean'] += sediment_dict['Ceq_mean'] / len(time_list)
-                    loss_acc['C_min'] = (
-                        sediment_dict['C_min']
-                        if loss_acc['C_min'] is None
-                        else min(loss_acc['C_min'], sediment_dict['C_min'])
-                    )
-                    loss_acc['C_max'] = (
-                        sediment_dict['C_max']
-                        if loss_acc['C_max'] is None
-                        else max(loss_acc['C_max'], sediment_dict['C_max'])
-                    )
-                    loss_acc['dzb_min'] = (
-                        sediment_dict['dzb_min']
-                        if loss_acc['dzb_min'] is None
-                        else min(loss_acc['dzb_min'], sediment_dict['dzb_min'])
-                    )
-                    loss_acc['dzb_max'] = (
-                        sediment_dict['dzb_max']
-                        if loss_acc['dzb_max'] is None
-                        else max(loss_acc['dzb_max'], sediment_dict['dzb_max'])
-                    )
+                    for cell_batch in cell_batches:
+                        # compute_sediment_loss 内部包含：
+                        # 输沙 PDE 残差、C≈C_capacity、入口平衡浓度、Δzb 的 Exner 约束。
+                        sediment_loss, sediment_dict = self.sediment_transport_loss_fn.compute_sediment_loss(
+                            self.sediment_model, self.flow_model, t_i, self.device,
+                            p_k_override=p_k_gauss,
+                            freeze_flow_params=freeze_flow_params,
+                            cell_indices=cell_batch,
+                        )
+                        weight = 1.0 / (len(time_list) * len(cell_batches))
+                        (sediment_loss * weight).backward()
+                        total_loss_value += float(sediment_loss.detach().cpu()) * weight
+                        loss_acc['transport'] += sediment_dict['transport'] * weight
+                        loss_acc['capacity'] += sediment_dict['capacity'] * weight
+                        loss_acc['initial'] += sediment_dict['initial'] * weight
+                        loss_acc['inlet'] += sediment_dict['inlet'] * weight
+                        loss_acc['bed_change'] += sediment_dict['bed_change'] * weight
+                        loss_acc['bed_initial'] += sediment_dict['bed_initial'] * weight
+                        loss_acc['Ceq_mean'] += sediment_dict['Ceq_mean'] * weight
+                        loss_acc['C_min'] = (
+                            sediment_dict['C_min']
+                            if loss_acc['C_min'] is None
+                            else min(loss_acc['C_min'], sediment_dict['C_min'])
+                        )
+                        loss_acc['C_max'] = (
+                            sediment_dict['C_max']
+                            if loss_acc['C_max'] is None
+                            else max(loss_acc['C_max'], sediment_dict['C_max'])
+                        )
+                        loss_acc['dzb_min'] = (
+                            sediment_dict['dzb_min']
+                            if loss_acc['dzb_min'] is None
+                            else min(loss_acc['dzb_min'], sediment_dict['dzb_min'])
+                        )
+                        loss_acc['dzb_max'] = (
+                            sediment_dict['dzb_max']
+                            if loss_acc['dzb_max'] is None
+                            else max(loss_acc['dzb_max'], sediment_dict['dzb_max'])
+                        )
 
                 torch.nn.utils.clip_grad_norm_(self.sediment_model.parameters(), max_norm=1.0)
                 self.sediment_optimizer.step()
@@ -299,6 +312,7 @@ class DecoupledTrainer:
 
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         p_k_gauss = self._gradation_at_gauss_tensor()
+        cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
         total_loss_value = 0.0
 
         for epoch in range(n_epochs):
@@ -312,17 +326,22 @@ class DecoupledTrainer:
                 flow_loss, _ = self.flow_loss_fn.compute_loss(self.flow_model, t_i, self.device)
                 flow_loss = flow_loss + 0.5 * self._compute_real_flow_boundary_loss(data_coords(t_i))
 
-                sediment_loss, _ = self.sediment_transport_loss_fn.compute_sediment_loss(
-                    self.sediment_model,
-                    self.flow_model,
-                    t_i,
-                    self.device,
-                    p_k_override=p_k_gauss,
-                    freeze_flow_params=False,
-                )
-                step_loss = flow_loss + sediment_loss
-                (step_loss / len(time_list)).backward()
-                total_loss_value += float(step_loss.detach().cpu()) / len(time_list)
+                # 水动力 loss 已经覆盖全 active 河道；泥沙 loss 按 cell batch 分摊。
+                (flow_loss / len(time_list)).backward(retain_graph=False)
+                total_loss_value += float(flow_loss.detach().cpu()) / len(time_list)
+                for cell_batch in cell_batches:
+                    sediment_loss, _ = self.sediment_transport_loss_fn.compute_sediment_loss(
+                        self.sediment_model,
+                        self.flow_model,
+                        t_i,
+                        self.device,
+                        p_k_override=p_k_gauss,
+                        freeze_flow_params=False,
+                        cell_indices=cell_batch,
+                    )
+                    weight = 1.0 / (len(time_list) * len(cell_batches))
+                    (sediment_loss * weight).backward()
+                    total_loss_value += float(sediment_loss.detach().cpu()) * weight
 
             torch.nn.utils.clip_grad_norm_(
                 list(self.flow_model.parameters()) + list(self.sediment_model.parameters()),
@@ -470,22 +489,24 @@ class DecoupledTrainer:
         for t0, t1 in zip(morph_times[:-1], morph_times[1:]):
             t_norm = float(t1) / max(self.simulation_time, 1.0e-12)
             dt = float(t1 - t0)
-            p_k_gauss = self._gradation_at_gauss_tensor()
-            closure = self.sediment_transport_loss_fn.compute_closure(
-                self.sediment_model,
-                self.flow_model,
-                t_norm,
-                self.device,
-                p_k_override=p_k_gauss,
-                freeze_flow_params=True,
-            )
-            dzb_dt_k = self.sediment_transport_loss_fn.exner_dzb_dt_k_cell(closure)
-            # dzb_dt_k 是各粒径组对床变的贡献；除以活动层厚度后近似转成比例变化。
-            delta_frac = dzb_dt_k.detach().cpu().numpy() * dt / max(self.active_layer_thickness, 1.0e-6)
             active = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
             updated = self.active_layer_frac.copy()
+            for cell_batch in self._active_cell_batches(self.sediment_cell_batch_size):
+                p_k_gauss = self._gradation_at_gauss_tensor()
+                closure = self.sediment_transport_loss_fn.compute_closure(
+                    self.sediment_model,
+                    self.flow_model,
+                    t_norm,
+                    self.device,
+                    p_k_override=p_k_gauss,
+                    freeze_flow_params=True,
+                    cell_indices=cell_batch,
+                )
+                dzb_dt_k = self.sediment_transport_loss_fn.exner_dzb_dt_k_cell(closure)
+                # dzb_dt_k 是各粒径组对床变的贡献；除以活动层厚度后近似转成比例变化。
+                delta_frac = dzb_dt_k.detach().cpu().numpy() * dt / max(self.active_layer_thickness, 1.0e-6)
+                updated[cell_batch] = np.clip(updated[cell_batch] + delta_frac, 1.0e-8, None)
             # 只更新河道活动单元；非河道单元的级配不参与物理计算。
-            updated[active] = np.clip(updated[active] + delta_frac[active], 1.0e-8, None)
             updated[active] = updated[active] / np.sum(updated[active], axis=1, keepdims=True)
             self.active_layer_frac = updated.astype(np.float32)
             self.history['p_min'].append(float(np.min(self.active_layer_frac[active])))
@@ -585,25 +606,40 @@ class DecoupledTrainer:
         if self.sediment_model is None:
             return diag
 
-        p_k_gauss = self._gradation_at_gauss_tensor()
-        # 这里使用 compute_closure，是为了同时拿到 C、C_capacity 和 Δzb，
-        # 避免诊断逻辑重复实现一遍输沙闭合。
-        closure = self.sediment_transport_loss_fn.compute_closure(
-            self.sediment_model,
-            self.flow_model,
-            t_norm,
-            self.device,
-            p_k_override=p_k_gauss,
-            freeze_flow_params=True,
-        )
-        C_a = closure['C_tk'][active_gauss_t]
-        Ceq_a = closure['C_capacity'][active_gauss_t]
-        dzb_a = closure['dzb_pred'][active_gauss_t]
+        c_sum = 0.0
+        ceq_sum = 0.0
+        n_val = 0
+        dzb_min = None
+        dzb_max = None
+        # 这里使用 compute_closure，是为了同时拿到 C、C_capacity 和 Δzb；
+        # 按 cell batch 统计，避免诊断阶段再次占满显存。
+        for cell_batch in self._active_cell_batches(self.sediment_cell_batch_size):
+            p_k_gauss = self._gradation_at_gauss_tensor()
+            closure = self.sediment_transport_loss_fn.compute_closure(
+                self.sediment_model,
+                self.flow_model,
+                t_norm,
+                self.device,
+                p_k_override=p_k_gauss,
+                freeze_flow_params=True,
+                cell_indices=cell_batch,
+            )
+            C_batch = closure['C_tk']
+            Ceq_batch = closure['C_capacity']
+            dzb_batch = closure['dzb_pred']
+            n_batch = int(C_batch.numel())
+            c_sum += float(torch.sum(C_batch).detach().cpu())
+            ceq_sum += float(torch.sum(Ceq_batch).detach().cpu())
+            n_val += n_batch
+            dzb_min_batch = float(torch.min(dzb_batch).detach().cpu())
+            dzb_max_batch = float(torch.max(dzb_batch).detach().cpu())
+            dzb_min = dzb_min_batch if dzb_min is None else min(dzb_min, dzb_min_batch)
+            dzb_max = dzb_max_batch if dzb_max is None else max(dzb_max, dzb_max_batch)
         diag.update({
-            'C_mean_diag': float(torch.mean(C_a).detach().cpu()),
-            'Ceq_mean_diag': float(torch.mean(Ceq_a).detach().cpu()),
-            'dzb_min_diag': float(torch.min(dzb_a).detach().cpu()),
-            'dzb_max_diag': float(torch.max(dzb_a).detach().cpu()),
+            'C_mean_diag': c_sum / max(n_val, 1),
+            'Ceq_mean_diag': ceq_sum / max(n_val, 1),
+            'dzb_min_diag': float(dzb_min or 0.0),
+            'dzb_max_diag': float(dzb_max or 0.0),
         })
         return diag
 
