@@ -30,6 +30,8 @@ class _CachedMeshTensors:
         self._gauss_coords_t = None
         self._gauss_normals_t = None
         self._gauss_weights_t = None
+        self._active_cell_mask_t = None
+        self._active_gauss_mask_t = None
 
     def _ensure_tensors(self, device):
         """惰性创建并缓存高斯积分点的 GPU 张量，设备不变时跳过。"""
@@ -41,7 +43,22 @@ class _CachedMeshTensors:
             self._mesh.gauss_normals, dtype=torch.float32, device=device)
         self._gauss_weights_t = torch.tensor(
             self._mesh.gauss_weights, dtype=torch.float32, device=device).unsqueeze(1)
+        cell_mask = getattr(self._mesh, 'active_cell_mask', np.ones(self._mesh.n_cells, dtype=bool))
+        self._active_cell_mask_t = torch.tensor(cell_mask, dtype=torch.float32, device=device).view(-1, 1)
+        gauss_mask = cell_mask[self._mesh.gauss_cell_id]
+        self._active_gauss_mask_t = torch.tensor(gauss_mask, dtype=torch.float32, device=device).view(-1, 1)
         self._cached_device = device
+
+    def _masked_cell_mean(self, value):
+        mask = self._active_cell_mask_t
+        return torch.sum(value * mask) / torch.clamp(torch.sum(mask), min=1.0)
+
+    def _masked_gauss_mean(self, value):
+        mask = self._active_gauss_mask_t
+        while mask.dim() < value.dim():
+            mask = mask.unsqueeze(-1)
+        n_extra = int(np.prod(value.shape[1:])) if value.dim() > 1 else 1
+        return torch.sum(value * mask) / torch.clamp(torch.sum(mask) * n_extra, min=1.0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -140,7 +157,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         flux_h = (h * u) * nx + (h * v) * ny
         bnd_h = torch.sum(flux_h.view(Nc, npp) * weights_r, dim=1, keepdim=True)
         cont_res = (vol_h + bnd_h) * self.continuity_scale
-        loss_continuity = torch.mean(cont_res ** 2)
+        loss_continuity = self._masked_cell_mean(cont_res ** 2)
 
         # ② 床面坡度源项：S = -g·h·∇zb·A
         dzb_dx_t, dzb_dy_t = self.mesh.get_bed_gradient(device)
@@ -169,7 +186,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         )
         vol_mx = hu_t_cell * self.mesh.cell_area
         mom_x_res = (vol_mx + bnd_mx - slope_x + fric_tx) * self.momentum_scale
-        loss_momentum_x = torch.mean(mom_x_res ** 2)
+        loss_momentum_x = self._masked_cell_mean(mom_x_res ** 2)
 
         # ⑤ y 方向动量方程
         flux_my = (h * v * u) * nx + (h * v * v + 0.5 * self.g * h * h) * ny
@@ -181,7 +198,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         )
         vol_my = hv_t_cell * self.mesh.cell_area
         mom_y_res = (vol_my + bnd_my - slope_y + fric_ty) * self.momentum_scale
-        loss_momentum_y = torch.mean(mom_y_res ** 2)
+        loss_momentum_y = self._masked_cell_mean(mom_y_res ** 2)
 
         total_loss = loss_continuity + loss_momentum_x + loss_momentum_y
         loss_dict = {
@@ -239,7 +256,11 @@ class SedimentTransportLoss(_CachedMeshTensors):
         w_initial_sediment=1.0,
         initial_sediment_concentration=None,
         w_inlet_sediment=1.0,
-        inlet_sediment_concentration=None,
+        w_bed_change=1.0,
+        porosity=0.4,
+        bed_slope_coefficient=0.2,
+        bed_slope_diffusion_weight=1.0,
+        exchange_weight=1.0,
         source_sharpness=EPS_VELOCITY_CLAMP,
     ):
         self.mesh = fvm_mesh
@@ -265,7 +286,11 @@ class SedimentTransportLoss(_CachedMeshTensors):
         self.w_initial_sediment = w_initial_sediment
         self.initial_sediment_concentration = initial_sediment_concentration
         self.w_inlet_sediment = w_inlet_sediment
-        self.inlet_sediment_concentration = inlet_sediment_concentration
+        self.w_bed_change = w_bed_change
+        self.porosity = porosity
+        self.bed_slope_coefficient = bed_slope_coefficient
+        self.bed_slope_diffusion_weight = bed_slope_diffusion_weight
+        self.exchange_weight = exchange_weight
         self.source_sharpness = source_sharpness
         self.closure_formula = ClosureFormulation(SimpleNamespace(
             rho_w=self.rho_w,
@@ -329,7 +354,11 @@ class SedimentTransportLoss(_CachedMeshTensors):
         volume_source = torch.mean(source.view(Nc, npp, K), dim=1) * self.mesh.cell_area
         # 总残差 = 存储项 + 对流项 - 扩散项 - 源汇项，平方后平均得到损失值
         residual = volume_storage + boundary_advection - boundary_diffusion - volume_source
-        loss = torch.mean((residual * self.residual_scale) ** 2)
+        cell_mask = self._active_cell_mask_t.view(Nc, 1)
+        loss = torch.sum((residual * self.residual_scale) ** 2 * cell_mask) / torch.clamp(
+            torch.sum(cell_mask) * K,
+            min=1.0,
+        )
         return loss, residual
 
     # 统一闭合计算
@@ -369,8 +398,17 @@ class SedimentTransportLoss(_CachedMeshTensors):
                 for p, old_flag in zip(flow_model.parameters(), old_requires_grad):
                     p.requires_grad_(old_flag)
 
-        # 输沙浓度
-        C_tk = sediment_model(xyt)
+        # 输沙模型输出：前 K 列为浓度，最后 1 列为累计床变 Δzb
+        sediment_out = sediment_model(xyt)
+        n_grains = len(self.grain_diameters)
+        if sediment_out.shape[1] < n_grains:
+            raise ValueError("SedimentPINN 输出维度必须至少等于粒径组数量。")
+        C_tk = sediment_out[:, :n_grains]
+        dzb_pred = (
+            sediment_out[:, n_grains:n_grains + 1]
+            if sediment_out.shape[1] > n_grains
+            else torch.zeros_like(C_tk[:, 0:1])
+        )
         
         # 级配
         if p_k_override is not None:
@@ -394,7 +432,7 @@ class SedimentTransportLoss(_CachedMeshTensors):
 
         return {
             'xyt': xyt, 'h': h, 'u': u, 'v': v,
-            'C_tk': C_tk, 'p_k': p_k,
+            'C_tk': C_tk, 'dzb_pred': dzb_pred, 'p_k': p_k,
             'beta_tk': beta_tk, 'epsilon_thk': epsilon_thk,
             'E_tk': E_tk, 'D_tk': D_tk,
             'C_capacity': C_capacity, 'vel_mag': vel_mag,
@@ -407,6 +445,65 @@ class SedimentTransportLoss(_CachedMeshTensors):
             'fall_velocity': wu_diag['ws'],
         }
 
+    def exner_dzb_dt_gauss(self, closure):
+        """根据当前闭合量计算高斯点上的 Exner 床变速率。
+
+        这个量不直接更新 mesh.zb，而是作为 Δzb 网络输出的物理约束：
+        d(Δzb)/dt 应接近 Exner 预测的床变速率。
+        """
+        dzb_dt_k_cell = self.exner_dzb_dt_k_cell(closure)
+        gauss_cell_id = torch.as_tensor(
+            self.mesh.gauss_cell_id,
+            dtype=torch.long,
+            device=closure['C_tk'].device,
+        )
+        return torch.sum(dzb_dt_k_cell, dim=1, keepdim=True)[gauss_cell_id]
+
+    def exner_dzb_dt_k_cell(self, closure):
+        """返回每个单元、每个粒径组的 Exner 床变速率 dzb_dt_k。
+
+        正值表示该粒径组对河床有淤积贡献，负值表示冲刷贡献。
+        """
+        npp = self.mesh.n_points_per_cell
+        nc = self.mesh.n_cells
+        n_grains = closure['E_tk'].shape[1]
+
+        net_deposition_rate = (
+            closure['D_tk'] - closure['E_tk']
+        ).view(nc, npp, n_grains).mean(dim=1)
+
+        weights = self._gauss_weights_t.view(nc, npp, 1)
+        nx = self._gauss_normals_t[:, 0:1]
+        ny = self._gauss_normals_t[:, 1:2]
+
+        dzb_dx_cell, dzb_dy_cell = self.mesh.get_bed_gradient(closure['C_tk'].device)
+        gauss_cell_id = torch.as_tensor(
+            self.mesh.gauss_cell_id,
+            dtype=torch.long,
+            device=closure['C_tk'].device,
+        )
+        dzb_dx = dzb_dx_cell[gauss_cell_id].view(nc * npp, 1)
+        dzb_dy = dzb_dy_cell[gauss_cell_id].view(nc * npp, 1)
+        bed_slope_normal = dzb_dx * nx + dzb_dy * ny
+
+        tau_skin = torch.clamp(closure['tau_skin'], min=EPS_DIVISION)
+        tau_cr = torch.clamp(closure['tau_cr'], min=EPS_DIVISION)
+        kappa_bk = self.bed_slope_coefficient * torch.sqrt(
+            tau_cr / torch.maximum(tau_skin, tau_cr)
+        )
+        q_bk = closure['p_k'] * closure['q_b']
+        slope_flux = kappa_bk * torch.abs(q_bk) * bed_slope_normal
+        slope_term = torch.sum(
+            slope_flux.view(nc, npp, n_grains) * weights,
+            dim=1,
+        ) / self.mesh.cell_area
+
+        dzb_dt_k = (
+            self.exchange_weight * net_deposition_rate
+            + self.bed_slope_diffusion_weight * slope_term
+        ) / (1.0 - self.porosity + EPS_DIVISION)
+        return dzb_dt_k
+
     # 仅输沙损失（独立更新 sediment_model）
 
     def compute_sediment_loss(
@@ -416,16 +513,26 @@ class SedimentTransportLoss(_CachedMeshTensors):
         T_norm,
         device,
         p_k_override=None,
+        freeze_flow_params=True,
     ):
-        """计算仅包含输沙 PDE 残差的损失，用于独立训练 sediment_model 时调用。"""
+        """计算泥沙网络损失。
+
+        这个 loss 不使用观测标签，完全由物理约束组成：
+        - transport_loss：分粒径输沙方程 FVM 残差；
+        - capacity_loss：浓度 C_k 接近 Wu 公式给出的输沙能力 C_capacity；
+        - initial_loss：初始时刻浓度接近设定初值；
+        - inlet_loss：上游入口浓度接近平衡输沙能力；
+        - bed_change_loss：网络输出 Δzb 的时间导数接近 Exner 床变速率。
+        """
         closure = self.compute_closure(
             sediment_model, flow_model, T_norm, device,
             p_k_override=p_k_override,
-            freeze_flow_params=True,
+            freeze_flow_params=freeze_flow_params,
         )
         xyt     = closure['xyt']
         h, u, v = closure['h'], closure['u'], closure['v']
         C_tk    = closure['C_tk']
+        dzb_pred = closure['dzb_pred']
         E_tk    = closure['E_tk']
         D_tk    = closure['D_tk']
         C_capacity = closure['C_capacity']
@@ -436,15 +543,33 @@ class SedimentTransportLoss(_CachedMeshTensors):
             closure['beta_tk'], closure['epsilon_thk'], E_tk, D_tk,
         )
 
-        capacity_loss = torch.mean((C_tk - C_capacity.detach()) ** 2)
+        # 容量闭合：C_capacity 只作为目标，不让该项反向拉动水动力闭合公式。
+        capacity_loss = self._masked_gauss_mean((C_tk - C_capacity.detach()) ** 2)
+
+        # 初始条件只在 t=0 生效，避免把所有时刻都压到初始浓度。
         initial_loss = self.initial_condition_loss(C_tk) if abs(float(T_norm)) < 1.0e-8 else torch.zeros_like(capacity_loss)
-        inlet_loss = self.inlet_boundary_loss(C_tk)
+
+        # 上游泥沙入口采用“平衡来沙”假设，不再指定固定浓度。
+        inlet_loss = self.inlet_equilibrium_loss(C_tk, C_capacity)
+
+        # Δzb 是网络的累计床变输出；其时间导数应符合 Exner 方程给出的床变速率。
+        dzb_t = self._dt(dzb_pred, xyt)
+        exner_dzb_dt = self.exner_dzb_dt_gauss(closure)
+        bed_change_loss = self._masked_gauss_mean((dzb_t - exner_dzb_dt) ** 2)
+
+        # t=0 时累计床变应为 0。
+        bed_initial_loss = (
+            self._masked_gauss_mean(dzb_pred ** 2)
+            if abs(float(T_norm)) < 1.0e-8
+            else torch.zeros_like(bed_change_loss)
+        )
 
         loss = (
             transport_loss
             + self.w_capacity * capacity_loss
             + self.w_initial_sediment * initial_loss
             + self.w_inlet_sediment * inlet_loss
+            + self.w_bed_change * (bed_change_loss + bed_initial_loss)
         )
         
         return loss, {
@@ -452,14 +577,19 @@ class SedimentTransportLoss(_CachedMeshTensors):
             'capacity': capacity_loss.item(),
             'initial': initial_loss.item(),
             'inlet': inlet_loss.item(),
+            'bed_change': bed_change_loss.item(),
+            'bed_initial': bed_initial_loss.item(),
             'residual_mean': torch.mean(torch.abs(residual)).item(),
             'C_min': torch.min(C_tk).item(),
             'C_max': torch.max(C_tk).item(),
+            'dzb_min': torch.min(dzb_pred).item(),
+            'dzb_max': torch.max(dzb_pred).item(),
             'Ceq_mean': torch.mean(C_capacity).item(),
             'U_mean': torch.mean(vel_mag).item(),
         }
 
     def initial_condition_loss(self, C_tk):
+        """初始浓度约束。"""
         if self.initial_sediment_concentration is None:
             return torch.zeros((), dtype=C_tk.dtype, device=C_tk.device)
         target = torch.as_tensor(
@@ -471,291 +601,38 @@ class SedimentTransportLoss(_CachedMeshTensors):
             raise ValueError("初始泥沙浓度维度必须与泥沙粒径组数量一致。")
         return torch.mean((C_tk - target.expand_as(C_tk)) ** 2)
 
-    def inlet_boundary_loss(self, C_tk):
-        if self.inlet_sediment_concentration is None:
-            return torch.zeros((), dtype=C_tk.dtype, device=C_tk.device)
-        target = torch.as_tensor(
-            self.inlet_sediment_concentration,
-            dtype=C_tk.dtype,
-            device=C_tk.device,
-        ).view(1, -1)
-        if target.shape[1] != C_tk.shape[1]:
-            raise ValueError("入口泥沙浓度维度必须与泥沙粒径组数量一致。")
+    def inlet_equilibrium_loss(self, C_tk, C_capacity):
+        """上游入口泥沙边界：入口浓度接近当前水流输沙能力。
 
-        coords = self._gauss_coords_t
-        neighbor_id = torch.as_tensor(self.mesh.gauss_neighbor_id, dtype=torch.long, device=C_tk.device)
-        inlet_x = float(self.mesh.bbox['xmin'])
-        inlet_mask = (neighbor_id < 0) & torch.isclose(
-            coords[:, 0],
-            torch.as_tensor(inlet_x, dtype=coords.dtype, device=coords.device),
-            atol=max(float(self.mesh.resolution) * 1.0e-6, 1.0e-6),
-            rtol=0.0,
-        )
+        真实算例入口在 DEM 活动河道最上方，水动力入口用总流量约束；
+        泥沙入口不再给固定浓度，而是给平衡浓度 C_capacity，避免清水入口造成
+        人为强冲刷。
+        """
+        inlet_mask = self._top_active_edge_mask(C_tk.device)
         if not torch.any(inlet_mask):
             return torch.zeros((), dtype=C_tk.dtype, device=C_tk.device)
-        inlet_c = C_tk[inlet_mask]
-        return torch.mean((inlet_c - target.expand_as(inlet_c)) ** 2)
+        return torch.mean((C_tk[inlet_mask] - C_capacity[inlet_mask].detach()) ** 2)
 
+    def _top_active_edge_mask(self, device):
+        """筛选 DEM 活动河道最上方一行的上边界高斯点。
 
-class MorphodynamicsUpdater:
-    """床变和两层级配显式更新。"""
+        这些点与 RealBoundaryConditionBuilder 的 top 入口保持一致，
+        用于施加入口泥沙平衡浓度约束。
+        """
+        active_2d = getattr(self.mesh, 'active_cell_mask_2d', None)
+        if active_2d is None or not np.any(active_2d):
+            top_cell_ids = np.arange(self.mesh.nx * (self.mesh.ny - 1), self.mesh.nx * self.mesh.ny)
+        else:
+            active_rows = np.where(active_2d.any(axis=1))[0]
+            top_row = int(active_rows[-1])
+            top_cols = np.where(active_2d[top_row, :])[0]
+            top_cell_ids = self.mesh.cell_index[top_row, top_cols]
 
-    def __init__(
-        self,
-        fvm_mesh,
-        device,
-        sediment_transport_loss_fn,
-        porosity=0.4,
-        bed_slope_coefficient=0.2,
-        min_bed_elevation=None,
-        use_bedload_flux_divergence=True,
-        exchange_weight=1.0,
-        bed_slope_diffusion_weight=1.0,
-        history=None,
-    ):
-        self.mesh = fvm_mesh
-        self.device = device
-        self.sediment_transport_loss_fn = sediment_transport_loss_fn
-        self.porosity = porosity
-        self.bed_slope_coefficient = bed_slope_coefficient
-        self.min_bed_elevation = min_bed_elevation
-        self.use_bedload_flux_divergence = use_bedload_flux_divergence
-        self.exchange_weight = exchange_weight
-        self.bed_slope_diffusion_weight = bed_slope_diffusion_weight
-        self.rho_bulk = self.sediment_transport_loss_fn.rho_s * (1.0 - porosity)
-        self.last_bed = self.mesh.zb.copy()
-        self.window_dt = 1.0
-        self.window_dt_current = 1.0
-        self.history = history
-
-        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
-        self.active_layer_frac = np.full(
-            (self.mesh.n_cells, n_grains),
-            1.0 / n_grains,
-            dtype=np.float32,
-        )
-        self.second_layer_frac = self.active_layer_frac.copy()
-        self.delta1 = self.active_layer_thickness_np(self.active_layer_frac)
-        self.delta2 = np.full(self.mesh.n_cells, 1.0, dtype=np.float32)
-
-    def gradation_at_gauss_tensor(self):
-        p = self.active_layer_frac[self.mesh.gauss_cell_id]
-        return torch.tensor(p, dtype=torch.float32, device=self.device)
-
-    def active_layer_thickness_np(self, fractions):
-        d = np.asarray(self.sediment_transport_loss_fn.grain_diameters, dtype=np.float32)
-        order = np.argsort(d)
-        d_sorted = d[order]
-        f_sorted = fractions[:, order]
-        cdf = np.cumsum(f_sorted, axis=1)
-        idx = np.argmax(cdf >= 0.9, axis=1)
-        d90 = d_sorted[idx]
-        return np.maximum(
-            self.sediment_transport_loss_fn.alpha_active_layer * d90,
-            1.0e-4,
-        ).astype(np.float32)
-
-    def compute_bed_change_closure(self, sediment_model, flow_model, T):
-        if sediment_model is None:
-            return None
-
-        flow_model.eval()
-        sediment_model.eval()
-        p_k_gauss = self.gradation_at_gauss_tensor()
-        return self.sediment_transport_loss_fn.compute_closure(
-            sediment_model,
-            flow_model,
-            T,
-            self.device,
-            p_k_override=p_k_gauss,
-            freeze_flow_params=True,
-        )
-
-    def exner_dzb_dt_cell(self, sediment_model, flow_model, T, closure=None):
-        if sediment_model is None:
-            return np.zeros(self.mesh.n_cells, dtype=np.float32), None, None
-
-        if closure is None:
-            closure = self.compute_bed_change_closure(sediment_model, flow_model, T)
-
-        npp = self.mesh.n_points_per_cell
-        nc = self.mesh.n_cells
-        loss_fn = self.sediment_transport_loss_fn
-        n_grains = closure['E_tk'].shape[1]
-
-        # E_tk/D_tk are volumetric exchange rates [m/s] because C_tk is a
-        # volumetric concentration and h * C_tk / T_adapt has units of m/s.
-        net_deposition_rate = (
-            closure['D_tk'] - closure['E_tk']
-        ).detach().view(nc, npp, n_grains).mean(dim=1)
-
-        weights = loss_fn._gauss_weights_t.view(nc, npp, 1)
-        nx = loss_fn._gauss_normals_t[:, 0:1]
-        ny = loss_fn._gauss_normals_t[:, 1:2]
-
-        dzb_dx_cell, dzb_dy_cell = self.mesh.get_bed_gradient(self.device)
-        gauss_cell_id = torch.as_tensor(self.mesh.gauss_cell_id, dtype=torch.long, device=self.device)
-        dzb_dx = dzb_dx_cell[gauss_cell_id].view(nc * npp, 1)
-        dzb_dy = dzb_dy_cell[gauss_cell_id].view(nc * npp, 1)
-        bed_slope_normal = dzb_dx * nx + dzb_dy * ny
-
-        tau_skin = torch.clamp(closure['tau_skin'], min=1.0e-8)
-        tau_cr = torch.clamp(closure['tau_cr'], min=1.0e-8)
-        kappa_bk = self.bed_slope_coefficient * torch.sqrt(
-            tau_cr / torch.maximum(tau_skin, tau_cr)
-        )
-        q_bk = closure['p_k'] * closure['q_b']
-        vel_mag = torch.clamp(closure['vel_mag'], min=1.0e-8)
-        qbx = q_bk * closure['u'] / vel_mag
-        qby = q_bk * closure['v'] / vel_mag
-        bedload_flux = qbx * nx + qby * ny
-        bedload_divergence = torch.sum(
-            bedload_flux.view(nc, npp, n_grains) * weights,
-            dim=1,
-        ) / self.mesh.cell_area
-        if not self.use_bedload_flux_divergence:
-            bedload_divergence = torch.zeros_like(bedload_divergence)
-
-        slope_flux = kappa_bk * torch.abs(q_bk) * bed_slope_normal
-        slope_term = torch.sum(
-            slope_flux.view(nc, npp, n_grains) * weights,
-            dim=1,
-        ) / self.mesh.cell_area
-
-        # Volumetric Exner equation:
-        #   (1 - porosity) dzb/dt = exchange_weight*(D - E)
-        #       - div(q_b) + bed_slope_diffusion_weight*slope_diffusion
-        # E/D are already volumetric rates [m/s], so do not divide by rho_s.
-        dzb_dt_k = (
-            self.exchange_weight * net_deposition_rate
-            - bedload_divergence.detach()
-            + self.bed_slope_diffusion_weight * slope_term.detach()
-        ) / (1.0 - self.porosity + 1.0e-8)
-
-        if self.history is not None:
-            exchange_dzb_dt = torch.sum(net_deposition_rate / (1.0 - self.porosity + 1.0e-8), dim=1)
-            bedload_dzb_dt = torch.sum(-bedload_divergence / (1.0 - self.porosity + 1.0e-8), dim=1)
-            slope_dzb_dt = torch.sum(slope_term / (1.0 - self.porosity + 1.0e-8), dim=1)
-            self.history['exchange_dzb_dt_min'].append(float(torch.min(exchange_dzb_dt).detach().cpu()))
-            self.history['exchange_dzb_dt_max'].append(float(torch.max(exchange_dzb_dt).detach().cpu()))
-            self.history.setdefault('bedload_dzb_dt_min', []).append(float(torch.min(bedload_dzb_dt).detach().cpu()))
-            self.history.setdefault('bedload_dzb_dt_max', []).append(float(torch.max(bedload_dzb_dt).detach().cpu()))
-            self.history.setdefault('slope_dzb_dt_min', []).append(float(torch.min(slope_dzb_dt).detach().cpu()))
-            self.history.setdefault('slope_dzb_dt_max', []).append(float(torch.max(slope_dzb_dt).detach().cpu()))
-
-        dzb_dt = torch.sum(dzb_dt_k, dim=1) # 总床变速率
-        dzb_dt_np = dzb_dt.cpu().numpy().astype(np.float32) # 转为 numpy 数组，供显式更新使用
-        dzb_dt_k_np = dzb_dt_k.cpu().numpy().astype(np.float32) # 分粒径床变速率，供级配更新使用
-        return dzb_dt_np, closure, dzb_dt_k_np
-
-    def update_bed_explicit(
-        self,
-        sediment_model,
-        flow_model,
-        T,
-        window_dt=None,
-        max_bed_change_per_step=None,
-    ):
-        if window_dt is None:
-            window_dt = self.window_dt
-
-        dzb_dt, closure, dzb_dt_k = self.exner_dzb_dt_cell(sediment_model, flow_model, T)
-        raw_delta_zb = dzb_dt * window_dt
-        max_delta = float(np.max(np.abs(raw_delta_zb))) if raw_delta_zb.size else 0.0
-        dt_scale = 1.0
-        if (
-            max_bed_change_per_step is not None
-            and max_bed_change_per_step > 0.0
-            and max_delta > max_bed_change_per_step
-        ):
-            dt_scale = max_bed_change_per_step / max(max_delta, 1.0e-12)
-
-        self.window_dt_current = window_dt * dt_scale
-        old_bed = self.mesh.zb.astype(np.float32)
-        new_bed = old_bed + dzb_dt * self.window_dt_current
-        if self.min_bed_elevation is not None:
-            new_bed = np.maximum(new_bed, float(self.min_bed_elevation)).astype(np.float32)
-            if self.window_dt_current > 0.0:
-                effective_dzb_dt = (new_bed - old_bed) / self.window_dt_current
-                original_dzb_dt = np.sum(dzb_dt_k, axis=1)
-                ratio = np.divide(
-                    effective_dzb_dt,
-                    original_dzb_dt,
-                    out=np.ones_like(effective_dzb_dt, dtype=np.float32),
-                    where=np.abs(original_dzb_dt) > 1.0e-12,
-                )
-                dzb_dt = effective_dzb_dt.astype(np.float32)
-                dzb_dt_k = (dzb_dt_k * ratio[:, None]).astype(np.float32)
-        self.mesh.update_bed(new_bed)
-
-        if self.history is not None:
-            self.history['exner_dzb_dt_min'].append(float(np.min(dzb_dt)))
-            self.history['exner_dzb_dt_max'].append(float(np.max(dzb_dt)))
-            self.history['bed_dt_scale'].append(float(dt_scale))
-            self.history['bed_dt_effective'].append(float(self.window_dt_current))
-            self.history['bed_delta_max'].append(float(np.max(np.abs(new_bed - old_bed))) if new_bed.size else 0.0)
-
-        return new_bed, closure, dzb_dt_k
-
-    def update_gradation_state(
-        self,
-        sediment_model,
-        flow_model,
-        T,
-        new_bed,
-        closure=None,
-        bed_change_rate_k=None,
-    ):
-        if sediment_model is None:
-            return None
-
-        if closure is None:
-            closure = self.compute_bed_change_closure(sediment_model, flow_model, T)
-
-        if bed_change_rate_k is None:
-            _, _, bed_change_rate_k = self.exner_dzb_dt_cell(
-                sediment_model,
-                flow_model,
-                T,
-                closure=closure,
-            )
-
-        delta_m_bed = bed_change_rate_k * self.rho_bulk * self.window_dt_current
-        rho_bulk = self.rho_bulk
-        m1_old = self.active_layer_frac * rho_bulk
-        m2_old = self.second_layer_frac * rho_bulk
-
-        delta_zb = np.asarray(new_bed, dtype=np.float32) - self.last_bed.astype(np.float32)
-        delta1_old = self.delta1.copy()
-        delta2_old = self.delta2.copy()
-        delta1_new = self.active_layer_thickness_np(self.active_layer_frac)
-        delta2_change = delta_zb - (delta1_new - delta1_old)
-        delta2_new = np.maximum(delta2_old + delta2_change, 1.0e-4)
-
-        m_star = np.where(delta2_change[:, None] >= 0.0, m1_old, m2_old)
-        m1_new = (
-            delta_m_bed
-            + m1_old * delta1_old[:, None]
-            - m_star * delta2_change[:, None]
-        ) / delta1_new[:, None]
-        m2_new = (
-            m2_old * delta2_old[:, None]
-            + m_star * delta2_change[:, None]
-        ) / delta2_new[:, None]
-
-        m1_new = np.clip(m1_new, 1.0e-12, None)
-        m2_new = np.clip(m2_new, 1.0e-12, None)
-        self.active_layer_frac = (m1_new / np.sum(m1_new, axis=1, keepdims=True)).astype(np.float32)
-        self.second_layer_frac = (m2_new / np.sum(m2_new, axis=1, keepdims=True)).astype(np.float32)
-        self.delta1 = delta1_new.astype(np.float32)
-        self.delta2 = delta2_new.astype(np.float32)
-        self.last_bed = np.asarray(new_bed, dtype=np.float32).copy()
-
-        if self.history is not None:
-            self.history['p_min'].append(float(np.min(self.active_layer_frac)))
-            self.history['p_max'].append(float(np.max(self.active_layer_frac)))
-
-        return self.active_layer_frac
+        cell_id = torch.as_tensor(self.mesh.gauss_cell_id, dtype=torch.long, device=device)
+        edge_id = torch.as_tensor(self.mesh.gauss_edge_id, dtype=torch.long, device=device)
+        top_cell_ids_t = torch.as_tensor(top_cell_ids, dtype=torch.long, device=device)
+        top_cell_mask = torch.isin(cell_id, top_cell_ids_t)
+        return top_cell_mask & (edge_id == 2)
 
 
 class ClosureFormulation:

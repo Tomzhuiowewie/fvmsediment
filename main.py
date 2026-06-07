@@ -2,50 +2,84 @@
 import torch
 
 from src.config import load_config
-from src.data import FVMeshPreprocessor, hump_initial_bed, build_boundary_conditions
+from src.data import (
+    FVMeshPreprocessor,
+    RealBoundaryConditionBuilder,
+    load_real_case_data,
+)
 from src.evaluate import visualize_results
 from src.model import FlowPINN, SedimentPINN
 from src.physics import SVEsPhysicsLoss, SedimentTransportLoss
 from src.train import DecoupledTrainer
 
 
-def run_hump_evolution_test(config_path="config.yaml"):
+def run_real_case(config_path="config.yaml"):
     """
-    流程：加载配置 → 构建网格 → 创建模型 → 解耦训练 → 可视化结果。
+    流程：加载真实配置 → 构建 DEM/FVM 网格 → 创建模型 → 三阶段训练 → 可视化结果。
+
+    这里的真实数据只作为物理输入条件：
+    - DEM 给初始床面 zb 和河道有效单元 mask；
+    - Excel 给上游流量、下游水位和床沙级配；
+
     """
     # 1. 加载配置 
     cfg = load_config(config_path)
 
-    # 2. 初始床面的 FVM 网格
+    # 2. 读取真实 DEM、边界过程线和床沙级配；网格范围和分辨率由 DEM 决定。
+    real_case = load_real_case_data(cfg.data)
+
+    # 粒径组可以由 config.yaml 显式指定；若留空，则直接使用 Excel 中 MainChannel 级配。
+    grain_diameters = cfg.grain_diameters
+    if not grain_diameters:
+        grain_diameters = real_case.grain_diameters
+    print(
+        f"DEM: {real_case.bed_grid.shape[1]}x{real_case.bed_grid.shape[0]}, "
+        f"resolution={real_case.resolution:.3f}m, active_cells={int(real_case.active_mask.sum())}"
+    )
+    print(
+        f"Hydrograph: Q={len(real_case.flow_times)} points, "
+        f"stage={len(real_case.stage_times)} points, "
+        f"gradation={len(real_case.grain_diameters)} classes"
+    )
+
     mesh = FVMeshPreprocessor(
-        cfg.bbox, 
-        cfg.resolution,
-        initial_bed=hump_initial_bed,
+        real_case.bbox,
+        real_case.resolution,
+        initial_bed=real_case.bed_grid,
         n_gauss_points=cfg.n_gauss_points,
+        # active_mask=True 的单元参与 PDE、诊断和绘图；非河道单元只保留 DEM 背景。
+        active_mask=real_case.active_mask,
     )
 
     # 3. 设备选择 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # 4. 创建水动力与输沙 PINN 模型
+    # 4. 创建水动力与输沙 PINN 模型。
+    #    flow_model 输出归一化的 h、u、v；
+    #    sediment_model 前 K 个输出为分粒径浓度 C_k，最后一个输出为累计床变 Δzb。
     flow_model = FlowPINN(input_dim=3, hidden_dim=64, num_block=4, output_dim=3).to(device)
 
-    n_grains = cfg.num_grain_classes
+    n_grains = len(grain_diameters)
+    initial_concentration = _match_concentration(cfg.initial_sediment_concentration, n_grains)
     sediment_model = SedimentPINN(
         input_dim=3,
         hidden_dim=64,
         num_block=4,
-        output_dim=n_grains,
-        initial_concentration=cfg.initial_sediment_concentration,
+        output_dim=n_grains + 1,
+        n_concentration_outputs=n_grains,
+        initial_concentration=initial_concentration,
+        bed_change_scale=cfg.bed_change_scale,
     ).to(device)
 
-    # 5. 创建物理损失函数
+    # 5. 创建物理损失函数。
+    #    水动力损失：非恒定浅水方程 FVM 残差；
+    #    泥沙损失：分粒径输沙方程、输沙能力闭合、入口平衡浓度和 Exner 床变约束。
     flow_loss_fn = SVEsPhysicsLoss(
         fvm_mesh=mesh,
         g=cfg.g,
         n_manning=cfg.n_manning,
-        bounds=cfg.bounds,
+        bounds=real_case.bounds,
         typical_depth=cfg.typical_depth,
         typical_velocity=cfg.typical_velocity,
         simulation_time=cfg.simulation_time,
@@ -54,9 +88,9 @@ def run_hump_evolution_test(config_path="config.yaml"):
 
     sediment_transport_loss_fn = SedimentTransportLoss(
         fvm_mesh=mesh,
-        bounds=cfg.bounds,
+        bounds=real_case.bounds,
         include_time_terms=cfg.include_time_terms,
-        grain_diameters=cfg.grain_diameters,
+        grain_diameters=grain_diameters,
         beta_default=cfg.beta_default,
         epsilon_default=cfg.epsilon_default,
         residual_scale=cfg.sediment_residual_scale,
@@ -71,16 +105,21 @@ def run_hump_evolution_test(config_path="config.yaml"):
         alpha_active_layer=cfg.alpha_active_layer,
         w_capacity=cfg.w_capacity,
         w_initial_sediment=cfg.w_initial_sediment,
-        initial_sediment_concentration=cfg.initial_sediment_concentration,
+        initial_sediment_concentration=initial_concentration,
         w_inlet_sediment=cfg.w_inlet_sediment,
-        inlet_sediment_concentration=cfg.inlet_sediment_concentration,
+        w_bed_change=cfg.training.get('w_bed_change', 1.0),
+        porosity=cfg.porosity,
+        bed_slope_coefficient=cfg.bed_slope_coefficient,
+        bed_slope_diffusion_weight=cfg.bed_slope_diffusion_weight,
+        exchange_weight=cfg.exchange_weight,
         source_sharpness=cfg.source_sharpness,
         simulation_time=cfg.simulation_time,
         typical_depth=cfg.typical_depth,
         typical_velocity=cfg.typical_velocity,
     )
 
-    # 6. 创建解耦训练器 
+    # 6. 创建三阶段训练器。
+    #    initial_gradation 是活动层初始级配，来自 Excel 的 MainChannel 累计级配换算。
     trainer = DecoupledTrainer(
         fvm_mesh=mesh,
         device=device,
@@ -89,62 +128,63 @@ def run_hump_evolution_test(config_path="config.yaml"):
         flow_loss_fn=flow_loss_fn,
         sediment_transport_loss_fn=sediment_transport_loss_fn,
         simulation_time=cfg.simulation_time,
-        porosity=cfg.porosity,
-        bed_slope_coefficient=cfg.bed_slope_coefficient,
-        min_bed_elevation=cfg.min_bed_elevation,
-        use_bedload_flux_divergence=cfg.use_bedload_flux_divergence,
-        exchange_weight=cfg.exchange_weight,
-        bed_slope_diffusion_weight=cfg.bed_slope_diffusion_weight,
+        initial_gradation=real_case.grain_fractions,
+        active_layer_thickness=cfg.active_layer_thickness,
         flow_lr=cfg.training.get('flow_lr', 1e-4),
         transport_lr=cfg.training.get('transport_lr', 1e-4),
     )
 
-    # 7. 边界条件构建器 
-    def bc_builder(t_norm):
-        return build_boundary_conditions(
-            t_norm=t_norm,
-            bbox=cfg.bbox,
-            bounds=cfg.bounds,
-            bc_default=cfg.bc_default,
-            typical_depth=cfg.typical_depth,
-            typical_velocity=cfg.typical_velocity,
-        )
-
-    # 8. 运行解耦训练 
-    print("开始 hump 演变测试...")
+    # 7. 真实边界条件：
+    #    上边界不是固定速度，而是约束断面流量积分 ∫h v_n dS = Q(t)；
+    #    下边界不是固定水深，而是用 stage(t)-zb 转换为目标水深。
+    bc_builder = RealBoundaryConditionBuilder(
+        mesh=mesh,
+        real_case=real_case,
+        typical_depth=cfg.typical_depth,
+        typical_velocity=cfg.typical_velocity,
+        simulation_time=cfg.simulation_time,
+    )
+    # 8. 运行三阶段训练：
+    #    阶段 1 只训练水动力 PINN；
+    #    阶段 2 冻结水动力，训练泥沙浓度和床变；
+    #    阶段 3 水动力和泥沙网络一起微调。
+    print("开始真实 DEM 泥沙演变训练...")
 
     bed_history = trainer.run_training(
         simulation_time=cfg.simulation_time,
         sample_dt=cfg.sample_dt,
-        window_dt=cfg.window_dt,
+        morph_dt=cfg.morph_dt,
         output_dt=cfg.output_dt,
-        flow_epochs_per_window=cfg.training.get('flow_epochs_per_step'),
-        sediment_epochs_per_window=cfg.training.get('sediment_epochs_per_step'),
+        flow_epochs=cfg.training['flow_epochs'],
+        sediment_epochs=cfg.training['sediment_epochs'],
         bc_builder=bc_builder,
-        flow_loss_tol=cfg.training.get('flow_loss_tol'),
-        sediment_loss_tol=cfg.training.get('sediment_loss_tol'),
-        extra_train_chunk=cfg.training.get('extra_train_chunk'),
-        max_extra_flow_epochs=cfg.training.get('max_extra_flow_epochs'),
-        max_extra_sediment_epochs=cfg.training.get('max_extra_sediment_epochs'),
-        max_bed_change_per_step=cfg.training.get('max_bed_change_per_step'),
+        joint_epochs=cfg.training['joint_epochs'],
     )
 
     # 9. 可视化结果 
     visualize_results(
         mesh=mesh,
         bed_history=bed_history,
-        bbox=cfg.bbox,
-        resolution=cfg.resolution,
+        bbox=real_case.bbox,
+        resolution=real_case.resolution,
         history=trainer.history,
         simulation_time=cfg.simulation_time,
-        case_name='hump',
+        case_name='real',
         output_dir='outputs',
     )
 
     return bed_history, trainer.history
 
 
+def _match_concentration(values, n_grains):
+    if len(values) == n_grains:
+        return values
+    if len(values) == 1:
+        return values * n_grains
+    return [0.0] * n_grains
+
+
 if __name__ == '__main__':
-    
+
     config_path = "config.yaml"
-    run_hump_evolution_test(config_path=config_path)
+    run_real_case(config_path=config_path)

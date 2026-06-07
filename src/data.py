@@ -1,85 +1,52 @@
 
+from dataclasses import dataclass
+from pathlib import Path
+import zipfile
+import xml.etree.ElementTree as ET
+
 import numpy as np
 import torch
+from PIL import Image
 
-from .model import FlowPINN
-
-
-def hump_initial_bed(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """hump 算例初始床面：在 [500,700]×[400,600] 区域生成正弦形凸起"""
-    in_hump = ((x >= 500) & (x <= 700) & (y >= 400) & (y <= 600))
-    zb = np.zeros_like(x)
-    zb[in_hump] = (
-        np.sin(np.pi * (x[in_hump] - 500) / 200) ** 2
-        * np.sin(np.pi * (y[in_hump] - 400) / 200) ** 2
-    )
-    return zb
+FT_TO_M = 0.3048
+CFS_TO_CMS = 0.028316846592
+MM_TO_M = 1.0e-3
 
 
-def build_boundary_conditions(
-    t_norm,
-    bbox,
-    bounds,
-    bc_default,
-    typical_depth,
-    typical_velocity,
-    n_bc=None,
-):
-    if n_bc is None:
-        n_bc = int(bc_default['n_bc'])
+@dataclass
+class RealCaseData:
+    """真实算例输入数据容器。
 
-    h_bc = bc_default['h']
-    u_bc = bc_default['u']
-    v_bc = bc_default['v']
-    bc_value = FlowPINN.encode_target(
-        torch.tensor([[h_bc]], dtype=torch.float32),
-        torch.tensor([[u_bc]], dtype=torch.float32),
-        torch.tensor([[v_bc]], dtype=torch.float32),
-        typical_depth,
-        typical_velocity,
-    ).numpy().astype(np.float32)
-
-    x_min = bbox['xmin']
-    x_max = bbox['xmax']
-    y_min = bbox['ymin']
-    y_max = bbox['ymax']
-    x_scale = bounds['x_max'] - bounds['x_min']
-    y_scale = bounds['y_max'] - bounds['y_min']
-    if x_scale == 0 or y_scale == 0:
-        raise ValueError("bounds 的 x/y 范围不能为 0。")
-
-    x_left_norm = (x_min - bounds['x_min']) / x_scale
-    y_bottom_norm = (y_min - bounds['y_min']) / y_scale
-    y_top_norm = (y_max - bounds['y_min']) / y_scale
-
-    # 入口边界条件：在 x=x_min 处，h, u, v 都有约束
-    y_inlet = np.linspace(y_min, y_max, n_bc)
-    y_inlet_norm = (y_inlet - bounds['y_min']) / y_scale
-    coords_inlet = np.stack([np.full(n_bc, x_left_norm), y_inlet_norm, np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
-    values_inlet = np.repeat(bc_value, n_bc, axis=0)
-    mask_inlet = np.array([[1.0, 1.0, 1.0]] * n_bc, dtype=np.float32)   # 入口边界条件：h, u, v 都有约束
-
-    # 壁面边界条件：在 y=y_min 和 y=y_max 处，只有 v 有约束（无穿透），h 和 u 沿壁面自由变化
-    x_wall = np.linspace(x_min, x_max, n_bc)
-    x_wall_norm = (x_wall - bounds['x_min']) / x_scale
-    coords_wall_bot = np.stack([x_wall_norm, np.full(n_bc, y_bottom_norm), np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
-    coords_wall_top = np.stack([x_wall_norm, np.full(n_bc, y_top_norm), np.ones(n_bc) * t_norm], axis=1).astype(np.float32)
-    values_wall = np.repeat(bc_value, n_bc, axis=0)
-    mask_wall = np.array([[0.0, 0.0, 1.0]] * n_bc, dtype=np.float32)
-
-    bc_coords = np.concatenate([coords_inlet, coords_wall_bot, coords_wall_top], axis=0)
-    bc_values = np.concatenate([values_inlet, values_wall, values_wall], axis=0)
-    bc_mask = np.concatenate([mask_inlet, mask_wall, mask_wall], axis=0)
-    return bc_coords, bc_values, bc_mask
+    所有字段在进入模型前已经统一到 SI 单位：
+    坐标/床面/水位为 m，流量为 m3/s，时间为 s，粒径为 m。
+    """
+    bbox: dict
+    bounds: dict
+    resolution: float
+    bed_grid: np.ndarray
+    active_mask: np.ndarray
+    flow_times: np.ndarray
+    flow_values: np.ndarray
+    stage_times: np.ndarray
+    stage_values: np.ndarray
+    grain_diameters: list[float]
+    grain_fractions: list[float]
 
 
 class FVMeshPreprocessor:
-    def __init__(self, bbox, resolution, initial_bed=None, n_gauss_points=2):
+    def __init__(self, bbox, resolution, initial_bed=None, n_gauss_points=2, active_mask=None):
+        """根据 DEM 规则网格生成 FVM 单元和边界高斯积分点。
+
+        当前仍采用矩形规则网格；河道范围通过 active_mask 过滤。
+        这样第一版可以保留 DEM 的原始栅格结构，同时避免非河道区域进入 PDE loss。
+        """
         self.bbox = bbox
         self.resolution = resolution
         self.n_gauss_points = n_gauss_points
+        self._active_mask_input = active_mask
         self._generate_mesh()
         self._initialize_bed(initial_bed)   # 初始化床面高程数据
+        self._initialize_active_mask(active_mask)
         self._setup_gauss_quadrature()  # 设置高斯积分点位置和权重
         self._precompute_edge_data()    # 预计算边界积分相关数据
 
@@ -108,13 +75,43 @@ class FVMeshPreprocessor:
         self.cell_index = np.arange(self.n_cells).reshape(self.ny, self.nx)
 
     def _initialize_bed(self, initial_bed):
+        """初始化床面高程 zb。
+
+        真实算例中 initial_bed 是 DEM 栅格；如果后续做理想算例，也可以传函数或常数。
+        """
         if initial_bed is None:
             self.zb = np.zeros(self.n_cells)
         elif callable(initial_bed):
             self.zb = initial_bed(self.cell_centers_x, self.cell_centers_y)
         else:
-            self.zb = np.full(self.n_cells, initial_bed)
+            bed_array = np.asarray(initial_bed, dtype=np.float32)
+            if bed_array.shape == (self.ny, self.nx):
+                self.zb = bed_array.reshape(-1)
+            elif bed_array.size == self.n_cells:
+                self.zb = bed_array.reshape(-1)
+            else:
+                self.zb = np.full(self.n_cells, float(initial_bed))
         self.zb_initial = self.zb.copy()
+
+    def _initialize_active_mask(self, active_mask):
+        """初始化河道有效单元 mask。
+
+        active=True 的单元参与物理残差、级配更新和结果统计；
+        inactive 单元保留在规则网格中，但不作为河道计算域。
+        """
+        if active_mask is None:
+            self.active_cell_mask = np.ones(self.n_cells, dtype=bool)
+            self.active_cell_mask_2d = self.active_cell_mask.reshape(self.ny, self.nx)
+            return
+        mask_array = np.asarray(active_mask, dtype=bool)
+        if mask_array.shape == (self.ny, self.nx):
+            self.active_cell_mask_2d = mask_array
+            self.active_cell_mask = mask_array.reshape(-1)
+        elif mask_array.size == self.n_cells:
+            self.active_cell_mask = mask_array.reshape(-1)
+            self.active_cell_mask_2d = self.active_cell_mask.reshape(self.ny, self.nx)
+        else:
+            raise ValueError("active_mask 形状必须与 FVM 网格一致。")
 
     def _setup_gauss_quadrature(self):
         if self.n_gauss_points == 2:
@@ -126,6 +123,12 @@ class FVMeshPreprocessor:
             self.gauss_weights_1d = np.array([2.0])
 
     def _precompute_edge_data(self):
+        """预计算每个单元四条边上的高斯点。
+
+        gauss_cell_id 记录高斯点属于哪个单元；
+        gauss_edge_id 记录属于下/右/上/左哪条边；
+        gauss_neighbor_id 用于识别外边界和后续扩展固壁边界。
+        """
         half_res = self.resolution / 2
         n_edges_per_cell = 4
         self.n_points_per_cell = n_edges_per_cell * self.n_gauss_points
@@ -167,6 +170,7 @@ class FVMeshPreprocessor:
         self.zb = np.clip(np.array(new_zb), -5.0, 5.0)
 
     def get_bed_gradient(self,device):
+        """用中心差分计算床面坡度 ∂zb/∂x 和 ∂zb/∂y。"""
         zb_2d = self.zb.reshape(self.ny, self.nx)
         dzb_dx = np.zeros_like(zb_2d)
         dzb_dy = np.zeros_like(zb_2d)
@@ -189,3 +193,235 @@ class FVMeshPreprocessor:
         )
 
 
+def load_real_case_data(data_cfg) -> RealCaseData:
+    """读取真实算例输入，并统一转换到 SI 单位。
+
+    DEM 提供初始床面和河道掩膜；Excel 提供非恒定边界过程线和床沙级配。
+    当前代码不读取 HEC-RAS 结果场，因此这些数据只作为输入条件，不作为监督标签。
+    """
+    dem_path = Path(data_cfg['dem_path'])
+    xlsx_path = Path(data_cfg['hydro_sediment_path'])
+    threshold_ft = float(data_cfg['channel_elevation_threshold_ft'])
+
+    bed_grid, active_mask, resolution = _read_dem_grid(dem_path, threshold_ft)
+    ny, nx = bed_grid.shape
+    bbox = {
+        'xmin': 0.0,
+        'xmax': float(nx * resolution),
+        'ymin': 0.0,
+        'ymax': float(ny * resolution),
+    }
+    bounds = {
+        'x_min': bbox['xmin'],
+        'x_max': bbox['xmax'],
+        'y_min': bbox['ymin'],
+        'y_max': bbox['ymax'],
+    }
+    flow_times, flow_values, stage_times, stage_values = _read_hydrographs(xlsx_path)
+    grain_diameters, grain_fractions = _read_main_channel_gradation(xlsx_path)
+    return RealCaseData(
+        bbox=bbox,
+        bounds=bounds,
+        resolution=resolution,
+        bed_grid=bed_grid,
+        active_mask=active_mask,
+        flow_times=flow_times,
+        flow_values=flow_values,
+        stage_times=stage_times,
+        stage_values=stage_values,
+        grain_diameters=grain_diameters,
+        grain_fractions=grain_fractions,
+    )
+
+
+def _read_dem_grid(path: Path, threshold_ft: float):
+    """读取 GeoTIFF DEM，并用绝对高程阈值划定河道活动单元。"""
+    with Image.open(path) as im:
+        arr_ft = np.asarray(im, dtype=np.float32)
+        tags = im.tag_v2
+        nodata = float(tags.get(42113, -9999))
+        pixel_scale = tags.get(33550, (25.0, 25.0, 0.0))
+        resolution = float(pixel_scale[0]) * FT_TO_M
+
+    # NoData 不参与河道判断；低于阈值的有效 DEM 单元视为河道活动单元。
+    valid = np.isfinite(arr_ft) & (arr_ft != nodata)
+    active = valid & (arr_ft <= threshold_ft)
+
+    # 非有效 DEM 单元用有效高程最大值填充，避免模型/绘图出现 NaN。
+    # 这些单元通常被 active_mask 排除，不参与物理训练。
+    fill_ft = float(np.nanmax(np.where(valid, arr_ft, np.nan)))
+    bed_ft = np.where(valid, arr_ft, fill_ft)
+    bed_m = bed_ft * FT_TO_M
+    return bed_m[::-1, :].astype(np.float32), active[::-1, :], resolution
+
+
+def _xlsx_tables(path: Path):
+    """直接解析 xlsx 内部 XML，避免为了科研脚本额外依赖 openpyxl。"""
+    zf = zipfile.ZipFile(path)
+    ns = {'a': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+    shared = []
+    if 'xl/sharedStrings.xml' in zf.namelist():
+        root = ET.fromstring(zf.read('xl/sharedStrings.xml'))
+        for si in root.findall('a:si', ns):
+            shared.append(''.join(t.text or '' for t in si.findall('.//a:t', ns)))
+
+    rels = ET.fromstring(zf.read('xl/_rels/workbook.xml.rels'))
+    rel_map = {r.attrib['Id']: r.attrib['Target'] for r in rels}
+    wb = ET.fromstring(zf.read('xl/workbook.xml'))
+    tables = {}
+    for sheet in wb.findall('.//a:sheet', ns):
+        name = sheet.attrib['name']
+        rid = sheet.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id']
+        ws = ET.fromstring(zf.read('xl/' + rel_map[rid]))
+        rows = []
+        for row in ws.findall('.//a:sheetData/a:row', ns):
+            values = []
+            for cell in row.findall('a:c', ns):
+                v = cell.find('a:v', ns)
+                value = '' if v is None else v.text
+                if cell.attrib.get('t') == 's' and value != '':
+                    value = shared[int(value)]
+                values.append(value)
+            rows.append(values)
+        tables[name] = rows
+    return tables
+
+
+def _to_float(value):
+    if value in (None, ''):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_hydrographs(path: Path):
+    """读取上游流量和下游水位过程线，并转成秒、m3/s、m。"""
+    rows = _xlsx_tables(path)['Unsteady Flow Data'][1:]
+    flow_t, flow_q, stage_t, stage_h = [], [], [], []
+    for row in rows:
+        if len(row) >= 3:
+            t = _to_float(row[1])
+            q = _to_float(row[2])
+            if t is not None and q is not None:
+                # Excel 中时间单位为小时，流量单位为 cfs。
+                flow_t.append(t * 3600.0)
+                flow_q.append(q * CFS_TO_CMS)
+        if len(row) >= 5:
+            t = _to_float(row[3])
+            h = _to_float(row[4])
+            if t is not None and h is not None:
+                # 下游 stage 用绝对水位表示，单位 ft。
+                stage_t.append(t * 3600.0)
+                stage_h.append(h * FT_TO_M)
+    return (
+        np.asarray(flow_t, dtype=np.float32),
+        np.asarray(flow_q, dtype=np.float32),
+        np.asarray(stage_t, dtype=np.float32),
+        np.asarray(stage_h, dtype=np.float32),
+    )
+
+
+def _read_main_channel_gradation(path: Path):
+    """读取 MainChannel 的累计级配曲线，并转成分组比例。"""
+    rows = _xlsx_tables(path)['Sediment Data']
+    diameters_mm, finer_pct = [], []
+    for row in rows:
+        if len(row) < 5:
+            continue
+        d = _to_float(row[2])
+        f = _to_float(row[4])
+        if d is not None and f is not None:
+            diameters_mm.append(d)
+            finer_pct.append(f)
+
+    diameters = np.asarray(diameters_mm, dtype=np.float32) * MM_TO_M
+    finer = np.asarray(finer_pct, dtype=np.float32) / 100.0
+    # Excel 给的是“累计通过百分比 % finer”，模型需要每个粒径组的体积分数。
+    fractions = np.diff(np.concatenate([[0.0], finer]))
+    keep = fractions > 1.0e-6
+    return diameters[keep].tolist(), fractions[keep].tolist()
+
+
+class RealBoundaryConditionBuilder:
+    def __init__(self, mesh, real_case: RealCaseData, typical_depth, typical_velocity,
+                 simulation_time, h_min=0.05):
+        """构造真实边界条件。
+
+        当前约定：
+        - top 为上游入口，使用流量过程线 Q(t)；
+        - bottom 为下游出口，使用水位过程线 stage(t)。
+        """
+        self.mesh = mesh
+        self.real_case = real_case
+        self.typical_depth = typical_depth
+        self.typical_velocity = typical_velocity
+        self.simulation_time = float(simulation_time)
+        self.h_min = h_min
+        self.inlet = self._edge_payload('top')
+        self.outlet = self._edge_payload('bottom')
+
+    def __call__(self, t_norm):
+        # 训练器传入归一化时间；这里还原成物理时间并插值真实过程线。
+        t_physical = float(t_norm) * max(self.simulation_time, 1.0)
+        q = float(np.interp(t_physical, self.real_case.flow_times, self.real_case.flow_values))
+        stage = float(np.interp(t_physical, self.real_case.stage_times, self.real_case.stage_values))
+        return {
+            'kind': 'real_flow_stage',
+            't_norm': float(t_norm),
+            'inlet_coords': self._coords_with_time(self.inlet['coords_norm'], t_norm),
+            'inlet_weights': self.inlet['weights'],
+            'target_flow': q,
+            'outlet_coords': self._coords_with_time(self.outlet['coords_norm'], t_norm),
+            'outlet_bed': self.outlet['bed'],
+            'target_stage': stage,
+            'typical_depth': self.typical_depth,
+            'typical_velocity': self.typical_velocity,
+            'h_min': self.h_min,
+            'inlet_edge': 'top',
+            'outlet_edge': 'bottom',
+        }
+
+    def _edge_payload(self, edge):
+        """从 active_mask 自动抽取入口/出口断面离散点。
+
+        入口取活动河道最上方一行，出口取最下方一行。
+        每个活动单元贡献一个断面点，权重近似为 DEM 像元宽度。
+        """
+        mask = self.mesh.active_cell_mask_2d
+        if edge == 'top':
+            row_candidates = np.where(mask.any(axis=1))[0]
+            row = int(row_candidates[-1])
+            cols = np.where(mask[row])[0]
+            y = self.mesh.bbox['ymax']
+        elif edge == 'bottom':
+            row_candidates = np.where(mask.any(axis=1))[0]
+            row = int(row_candidates[0])
+            cols = np.where(mask[row])[0]
+            y = self.mesh.bbox['ymin']
+        else:
+            raise ValueError("当前真实数据边界只实现 top/bottom。")
+        if cols.size == 0:
+            raise ValueError(f"{edge} 边界没有河道活动单元。")
+        x = self.mesh.bbox['xmin'] + (cols + 0.5) * self.mesh.resolution
+        coords_phys = np.stack([x, np.full_like(x, y, dtype=np.float32)], axis=1)
+        coords_norm = np.stack([
+            (coords_phys[:, 0] - self.real_case.bounds['x_min'])
+            / (self.real_case.bounds['x_max'] - self.real_case.bounds['x_min']),
+            (coords_phys[:, 1] - self.real_case.bounds['y_min'])
+            / (self.real_case.bounds['y_max'] - self.real_case.bounds['y_min']),
+        ], axis=1).astype(np.float32)
+        cell_ids = row * self.mesh.nx + cols
+        return {
+            'coords_norm': coords_norm,
+            'weights': np.full(cols.size, self.mesh.resolution, dtype=np.float32),
+            'bed': self.mesh.zb_initial[cell_ids].astype(np.float32),
+        }
+
+    @staticmethod
+    def _coords_with_time(coords_norm, t_norm):
+        return np.concatenate(
+            [coords_norm, np.full((coords_norm.shape[0], 1), float(t_norm), dtype=np.float32)],
+            axis=1,
+        )

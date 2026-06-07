@@ -1,5 +1,5 @@
-# evaluate.py - training result visualization
-# Plots bed evolution contours, profile sections, and training history curves.
+# evaluate.py - 训练结果可视化
+# 输出三类图：床面等值图、中心剖面、训练损失历史。
 
 import os
 
@@ -18,20 +18,28 @@ except ImportError:
 
 
 def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_time, case_name='default', output_dir=None):
+    if not HAS_MATPLOTLIB:
+        print("未安装 matplotlib，跳过绘图。")
+        return
 
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
-    plot_context = _prepare_plot_context(bed_history, bbox, resolution, history, simulation_time)
+    plot_context = _prepare_plot_context(mesh, bed_history, bbox, resolution, history, simulation_time)
     save_path = _make_save_path(case_name, output_dir)
 
     plot_bed_evolution(bed_history, plot_context, save_path('bed'))
     plot_bed_profiles(bed_history, plot_context, save_path('profiles'))
     plot_training_history(history, plot_context, simulation_time, save_path('losses'))
 
-    dz = bed_history[-1].max() - bed_history[0].max()
-    print(f'\n  Initial peak: {bed_history[0].max():.4f}m  Final peak: {bed_history[-1].max():.4f}m')
-    print(f'  Peak change: {dz:+.4f}m ({dz / max(bed_history[0].max(), EPS_SAFE) * 100:.1f}%)')
+    active_mask = plot_context.get('active_mask')
+    z0 = _mask_bed(bed_history[0].reshape(plot_context['ny'], plot_context['nx']), active_mask)
+    z1 = _mask_bed(bed_history[-1].reshape(plot_context['ny'], plot_context['nx']), active_mask)
+    initial_peak = float(np.nanmax(z0))
+    final_peak = float(np.nanmax(z1))
+    dz = final_peak - initial_peak
+    print(f'\n  Initial river peak: {initial_peak:.4f}m  Final river peak: {final_peak:.4f}m')
+    print(f'  Peak change: {dz:+.4f}m ({dz / max(initial_peak, EPS_SAFE) * 100:.1f}%)')
 
 
 def _make_save_path(case_name, output_dir):
@@ -42,7 +50,8 @@ def _make_save_path(case_name, output_dir):
     return _save_path
 
 
-def _prepare_plot_context(bed_history, bbox, resolution, history, simulation_time):
+def _prepare_plot_context(mesh, bed_history, bbox, resolution, history, simulation_time):
+    # DEM 网格来自真实数据，绘图坐标直接使用 DEM 对应的规则网格。
     nx = int((bbox['xmax'] - bbox['xmin']) / resolution)
     ny = int((bbox['ymax'] - bbox['ymin']) / resolution)
     xc = np.linspace(bbox['xmin'] + resolution / 2, bbox['xmax'] - resolution / 2, nx)
@@ -55,6 +64,9 @@ def _prepare_plot_context(bed_history, bbox, resolution, history, simulation_tim
     if len(output_times) != n_t:
         output_times = np.linspace(0.0, simulation_time, n_t).tolist()
     time_ids = np.linspace(0, n_t - 1, 6, dtype=int)
+    active_mask = getattr(mesh, 'active_cell_mask_2d', None)
+    if active_mask is not None:
+        active_mask = np.asarray(active_mask, dtype=bool).reshape(ny, nx)
 
     return {
         'nx': nx,
@@ -67,7 +79,14 @@ def _prepare_plot_context(bed_history, bbox, resolution, history, simulation_tim
         'time_scale': time_scale,
         'output_times': output_times,
         'time_ids': time_ids,
+        'active_mask': active_mask,
     }
+
+
+def _mask_bed(zb_2d, active_mask):
+    if active_mask is None:
+        return zb_2d
+    return np.where(active_mask, zb_2d, np.nan)
 
 
 def plot_bed_evolution(bed_history, plot_context, save_path):
@@ -79,24 +98,28 @@ def plot_bed_evolution(bed_history, plot_context, save_path):
     time_scale = plot_context['time_scale']
     output_times = plot_context['output_times']
     time_ids = plot_context['time_ids']
-    zmin_global = min(float(np.min(zb)) for zb in bed_history)
-    zmax_global = max(float(np.max(zb)) for zb in bed_history)
+    active_mask = plot_context.get('active_mask')
+    masked_history = [
+        _mask_bed(np.asarray(zb).reshape(ny, nx), active_mask)
+        for zb in bed_history
+    ]
+    zmin_global = min(float(np.nanmin(zb)) for zb in masked_history)
+    zmax_global = max(float(np.nanmax(zb)) for zb in masked_history)
     zmin_plot = min(0.0, zmin_global)
     zmax_plot = max(zmax_global + 0.01, 0.1)
     levels = np.linspace(zmin_plot, zmax_plot, 25)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 11))
     for ax, tid in zip(axes.flatten(), time_ids):
-        zb = bed_history[tid].reshape(ny, nx)
+        zb = masked_history[tid]
         t_v = output_times[tid] / time_scale
         im = ax.contourf(X, Y, zb, levels=levels, cmap='terrain', extend='both')
         ax.contour(X, Y, zb, levels=5, colors='k', linewidths=0.4)
-        ax.set_title(f't={t_v:.1f}{time_unit} max={zb.max():.3f}m')
+        ax.set_title(f't={t_v:.1f}{time_unit} max={np.nanmax(zb):.3f}m')
         ax.set_aspect('equal')
         ax.set_xlabel('x(m)')
         ax.set_ylabel('y(m)')
         plt.colorbar(im, ax=ax)
-        ax.plot([500, 700, 700, 500, 500], [400, 400, 600, 600, 400], 'r--', lw=1, alpha=0.5)
     plt.suptitle('Bed Evolution', fontsize=13)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -113,20 +136,22 @@ def plot_bed_profiles(bed_history, plot_context, save_path):
     time_scale = plot_context['time_scale']
     output_times = plot_context['output_times']
     time_ids = plot_context['time_ids']
+    active_mask = plot_context.get('active_mask')
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    j500 = np.argmin(np.abs(yc - 500))
-    i600 = np.argmin(np.abs(xc - 600))
+    # 真实算例没有固定参考断面，默认取 DEM 中心横纵剖面。
+    j_mid = len(yc) // 2
+    i_mid = len(xc) // 2
     colors = plt.cm.plasma(np.linspace(0, 1, len(time_ids)))
     for c, tid in zip(colors, time_ids):
-        zb = bed_history[tid].reshape(ny, nx)
+        zb = _mask_bed(bed_history[tid].reshape(ny, nx), active_mask)
         t_v = output_times[tid] / time_scale
-        axes[0].plot(xc, zb[j500, :], color=c, lw=2, label=f't={t_v:.1f}{time_unit}')
-        axes[1].plot(yc, zb[:, i600], color=c, lw=2, label=f't={t_v:.1f}{time_unit}')
+        axes[0].plot(xc, zb[j_mid, :], color=c, lw=2, label=f't={t_v:.1f}{time_unit}')
+        axes[1].plot(yc, zb[:, i_mid], color=c, lw=2, label=f't={t_v:.1f}{time_unit}')
     for ax, xl, lb in zip(
         axes,
-        [(300, 800), (300, 700)],
-        ['Centerline at y=500m (Reference: Fig. 7/12)', 'Cross-section at x=600m'],
+        [(float(xc[0]), float(xc[-1])), (float(yc[0]), float(yc[-1]))],
+        [f'Center row y={yc[j_mid]:.1f}m', f'Center column x={xc[i_mid]:.1f}m'],
     ):
         ax.set_xlim(xl)
         ax.legend(fontsize=8)
@@ -164,8 +189,10 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
     axes[0, 1].grid(alpha=0.3)
 
     pl(axes[1, 0], history.get('sediment_loss', []), 'Sed', 'g')
+    pl(axes[1, 0], history.get('joint_loss', []), 'Joint', 'black', '--')
     pl(axes[1, 0], history.get('transport_loss', []), 'C PDE', 'teal', ':')
     pl(axes[1, 0], history.get('capacity_loss', []), 'Capacity', 'orange', '--')
+    pl(axes[1, 0], history.get('bed_change_loss', []), 'Bed Δzb', 'red', '-.')
     pl(axes[1, 0], history.get('initial_sediment_loss', []), 'Initial C', 'purple', '-.')
     pl(axes[1, 0], history.get('inlet_sediment_loss', []), 'Inlet C', 'brown', '-.')
     axes[1, 0].set_title('Sediment Loss')
@@ -183,17 +210,13 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
         axes[1, 1].legend(fontsize=8)
         axes[1, 1].grid(alpha=0.3)
 
-    if history.get('exner_dzb_dt_min'):
-        axes[2, 0].plot(history['exner_dzb_dt_min'], 'r-', lw=1.5, label='Exner min dzb/dt')
-        axes[2, 0].plot(history['exner_dzb_dt_max'], 'g-', lw=1.5, label='Exner max dzb/dt')
-        if history.get('exchange_dzb_dt_min'):
-            axes[2, 0].plot(history['exchange_dzb_dt_min'], 'm--', lw=1.3, label='D-E min dzb/dt')
-            axes[2, 0].plot(history['exchange_dzb_dt_max'], 'c--', lw=1.3, label='D-E max dzb/dt')
+    if history.get('dzb_min'):
+        axes[2, 0].plot(history['dzb_min'], 'r-', lw=1.5, label='Δzb min')
+        axes[2, 0].plot(history['dzb_max'], 'g-', lw=1.5, label='Δzb max')
         axes[2, 0].axhline(0.0, color='k', lw=0.8, alpha=0.5)
-        axes[2, 0].set_yscale('symlog', linthresh=1.0e-6)
-        axes[2, 0].set_xlabel('Step')
-        axes[2, 0].set_ylabel('dzb/dt (m/s)')
-        axes[2, 0].set_title('Signed Bed Change Rate')
+        axes[2, 0].set_xlabel('Epoch')
+        axes[2, 0].set_ylabel('Δzb (m)')
+        axes[2, 0].set_title('Predicted Bed Change')
         axes[2, 0].legend(fontsize=8)
         axes[2, 0].grid(alpha=0.3)
 

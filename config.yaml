@@ -1,35 +1,28 @@
-domain:
-  bounds:
-    x_min: 0.0
-    x_max: 1000.0
-    y_min: 0.0
-    y_max: 1000.0
-  bbox:
-    xmin: 0.0
-    xmax: 1000.0
-    ymin: 0.0
-    ymax: 1000.0
-  resolution: 25.0
+data:
+  dem_path: data/100ft.test1d.tif
+  hydro_sediment_path: data/FlowSedimentData.xlsx
+  channel_elevation_threshold_ft: 680.0
+  inlet_edge: top
+  outlet_edge: bottom
 
 fvm:
   n_gauss_points: 2
 
 physics:
   include_time_terms: true
-  simulation_time: 600  # 总模拟时间（秒）
-  n_windows: 60  # 模拟窗口数量
-  window_dt: 10  # 每个模拟窗口的时间长度（秒）
-  sample_dt: 1.0  # 训练数据采样时间间隔（秒）
-  output_dt: 10  # 结果输出时间间隔（秒）
+  simulation_time: 2937600  # 总模拟时间（秒）；对应 Excel 过程线约 34 天
+  sample_dt: 86400  # 训练采样时间间隔（秒）；当前按每天一个训练时刻
+  morph_dt: 86400  # 级配显式更新时间间隔（秒）
+  output_dt: 86400  # 结果输出时间间隔（秒）
 
   flow:
     typical_depth: 8
-    typical_velocity: auto  # 自动绑定 boundary.u/v 的初始速度模长，并留 20% 输出裕度
+    typical_velocity: 1.0
     g: 9.81
     n_manning: 0.01  # 曼宁糙率
 
   sediment:
-    grain_diameters: [0.00015,0.0003]
+    grain_diameters: [0.00025, 0.0005, 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128]
     beta_default: 1.0
     epsilon_default: 0.1
     residual_scale: 1.0
@@ -42,34 +35,22 @@ physics:
     alpha_active_layer: 10.0
     w_capacity: 1
     w_initial_sediment: 5
-    initial_concentration: [0, 0]  # 接近当前水流输沙能力，避免清水全域冲刷
-    w_inlet_sediment: 1.0
-    inlet_concentration: [0, 0]  # 入口给定接近平衡浓度，减少饥饿水流下切
+    initial_concentration: 0  # 接近当前水流输沙能力，避免清水全域冲刷
+    w_inlet_sediment: 1.0  # 上游入口浓度约束到当前水流输沙能力
     source_sharpness: 0.000001
 
   morphodynamics:
     porosity: 0.4
+    active_layer_thickness: 0.5
     bed_slope_coefficient: 0.05
-    min_bed_elevation: null
-    use_bedload_flux_divergence: true
-    exchange_weight: 0.0
+    bed_change_scale: 0.1
+    exchange_weight: 1.0
     bed_slope_diffusion_weight: 1.0
 
-boundary:
-  n_bc: 50
-  t_normalized: 0.5
-  h: 10 # 水深
-  u: 1  # 流速
-  v: 0.0  # 横向速度
-
 training:
-  flow_epochs_per_step: 10
-  sediment_epochs_per_step: 20
-  extra_train_chunk: 0
-  max_extra_flow_epochs: 0
-  max_extra_sediment_epochs:  0
+  flow_epochs: 10
+  sediment_epochs: 20
+  joint_epochs: 20
   flow_lr: 0.001
   transport_lr: 0.001
-  flow_loss_tol: 0.0005
-  sediment_loss_tol: 0.0001
-  max_bed_change_per_step: 0.02 # 每步训练后床面最大允许变化（相对于初始床面）
+  w_bed_change: 1.0

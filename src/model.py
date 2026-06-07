@@ -1,7 +1,7 @@
 # model.py – PINN 网络模型定义
 # 包含：残差块、基类 PINN、以及两个物理子网络
 #   FlowPINN      → 水深 h、流速 u, v
-#   SedimentPINN  → 总输沙浓度 C_tk
+#   SedimentPINN  → 总输沙浓度 C_tk 和累计床变 Δzb
 
 import torch
 import torch.nn as nn
@@ -98,12 +98,19 @@ class FlowPINN(BasePINN):
 
 class SedimentPINN(BasePINN):
     """
-    总输沙输移 PINN：输入 (x, y, t)，输出各粒径级总输沙浓度 C_tk
+    总输沙输移 PINN：输入 (x, y, t)，输出各粒径级总输沙浓度 C_tk 和累计床变 Δzb。
     """
 
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4,
-                 output_dim=1, positive_output=True, initial_concentration=None):
+                 output_dim=1, positive_output=True, initial_concentration=None,
+                 n_concentration_outputs=None, bed_change_scale=0.1):
         self.positive_output = positive_output
+        self.n_concentration_outputs = (
+            output_dim if n_concentration_outputs is None else int(n_concentration_outputs)
+        )
+        self.bed_change_scale = float(bed_change_scale)
+        if output_dim < self.n_concentration_outputs:
+            raise ValueError("SedimentPINN output_dim 不能小于浓度输出维度。")
         super().__init__(input_dim, hidden_dim, num_block, output_dim)
         if self.positive_output:
             self._init_positive_output(output_dim, initial_concentration)
@@ -114,17 +121,19 @@ class SedimentPINN(BasePINN):
         if not isinstance(final_linear, nn.Linear):
             return
 
+        n_c = self.n_concentration_outputs
         if initial_concentration is None:
-            target = torch.full((output_dim,), 1.0e-6, dtype=final_linear.bias.dtype)
+            target = torch.full((n_c,), 1.0e-6, dtype=final_linear.bias.dtype)
         else:
             target = torch.as_tensor(initial_concentration, dtype=final_linear.bias.dtype)
             if target.numel() == 1:
-                target = target.repeat(output_dim)
-            if target.numel() != output_dim:
+                target = target.repeat(n_c)
+            if target.numel() != n_c:
                 raise ValueError("初始泥沙浓度维度必须与 SedimentPINN 输出维度一致。")
             target = torch.clamp(target, min=1.0e-6)
 
-        bias = torch.log(torch.expm1(target))
+        bias = torch.zeros(output_dim, dtype=final_linear.bias.dtype)
+        bias[:n_c] = torch.log(torch.expm1(target))
         with torch.no_grad():
             nn.init.normal_(final_linear.weight, mean=0.0, std=1.0e-4)
             final_linear.bias.copy_(bias)
@@ -134,8 +143,13 @@ class SedimentPINN(BasePINN):
         for block in self.res_blocks:
             x = block(x)
         out = self.output_layer(x)
-        # softplus 确保浓度非负，且比 ReLU 更平滑，适合自动微分
-        return F.softplus(out) if self.positive_output else out
+        if not self.positive_output:
+            return out
+        c = F.softplus(out[:, :self.n_concentration_outputs])
+        if out.shape[1] == self.n_concentration_outputs:
+            return c
+        dzb = out[:, self.n_concentration_outputs:] * self.bed_change_scale
+        return torch.cat([c, dzb], dim=1)
 
     # ---------- 自动微分工具 ----------
 
