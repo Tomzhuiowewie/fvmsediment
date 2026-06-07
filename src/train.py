@@ -3,11 +3,58 @@
 # 阶段 3：两个网络联合优化。床面历史由泥沙网络输出的 Δzb 生成。
 
 import numpy as np
+import sys
+import time
 import torch
 import torch.nn.functional as F
 
 from .model import FlowPINN
 from .utils import build_xyt
+
+
+class _ProgressBar:
+    """轻量训练进度条，避免服务器环境额外依赖 tqdm。"""
+
+    def __init__(self, title, total, width=28):
+        self.title = title
+        self.total = max(int(total), 1)
+        self.width = width
+        self.current = 0
+        self.start = time.time()
+        self.last_message_len = 0
+        self._render()
+
+    def update(self, step=1, loss=None):
+        self.current = min(self.total, self.current + int(step))
+        self._render(loss=loss)
+
+    def close(self, loss=None):
+        self.current = self.total
+        self._render(loss=loss)
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+    def _render(self, loss=None):
+        ratio = self.current / self.total
+        filled = int(self.width * ratio)
+        bar = '#' * filled + '-' * (self.width - filled)
+        elapsed = time.time() - self.start
+        if self.current == 0:
+            remain_text = '--'
+        else:
+            rate = self.current / max(elapsed, 1.0e-8)
+            remain = (self.total - self.current) / max(rate, 1.0e-8)
+            remain_text = f'{remain:6.1f}s'
+        msg = (
+            f"\r{self.title} [{bar}] {self.current}/{self.total} "
+            f"{ratio * 100:5.1f}% elapsed={elapsed:6.1f}s eta={remain_text}"
+        )
+        if loss is not None:
+            msg += f" loss={loss:.3e}"
+        pad = max(self.last_message_len - len(msg), 0)
+        sys.stdout.write(msg + ' ' * pad)
+        sys.stdout.flush()
+        self.last_message_len = len(msg)
 
 
 class DecoupledTrainer:
@@ -185,6 +232,7 @@ class DecoupledTrainer:
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         self.flow_model.train()
         total_loss_value = 0.0
+        progress = _ProgressBar('Flow PINN', n_epochs * len(time_list))
         for epoch in range(n_epochs):
             self.flow_optimizer.zero_grad()
             total_loss_value = 0.0
@@ -199,6 +247,7 @@ class DecoupledTrainer:
                 total_loss_value += float(step_loss.detach().cpu()) / len(time_list)
                 for key in loss_acc:
                     loss_acc[key] += loss_dict[key] / len(time_list)
+                progress.update(loss=total_loss_value)
             torch.nn.utils.clip_grad_norm_(self.flow_model.parameters(), max_norm=1.0)
             self.flow_optimizer.step()
             self.flow_scheduler.step(total_loss_value)
@@ -206,6 +255,7 @@ class DecoupledTrainer:
             self.history['continuity'].append(loss_acc['continuity'])
             self.history['momentum_x'].append(loss_acc['momentum_x'])
             self.history['momentum_y'].append(loss_acc['momentum_y'])
+        progress.close(loss=total_loss_value)
         return total_loss_value
 
     def train_sediment_phase(self, n_epochs, T_norm, freeze_flow_params=True):
@@ -220,6 +270,7 @@ class DecoupledTrainer:
         p_k_gauss = self._gradation_at_gauss_tensor()
         cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
         total_loss_value = 0.0
+        progress = _ProgressBar('Sediment PINN', n_epochs * len(time_list) * len(cell_batches))
 
         for epoch in range(n_epochs):
             total_loss_value = 0.0
@@ -280,6 +331,7 @@ class DecoupledTrainer:
                             if loss_acc['dzb_max'] is None
                             else max(loss_acc['dzb_max'], sediment_dict['dzb_max'])
                         )
+                        progress.update(loss=total_loss_value)
 
                 torch.nn.utils.clip_grad_norm_(self.sediment_model.parameters(), max_norm=1.0)
                 self.sediment_optimizer.step()
@@ -299,6 +351,7 @@ class DecoupledTrainer:
                 self.history['dzb_min'].append(loss_acc['dzb_min'])
                 self.history['dzb_max'].append(loss_acc['dzb_max'])
                 self.history['Ceq_mean'].append(loss_acc['Ceq_mean'])
+        progress.close(loss=total_loss_value)
         return total_loss_value
 
     def train_joint_phase(self, n_epochs, T_norm, data_coords=None):
@@ -314,6 +367,7 @@ class DecoupledTrainer:
         p_k_gauss = self._gradation_at_gauss_tensor()
         cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
         total_loss_value = 0.0
+        progress = _ProgressBar('Joint PINN', max(n_epochs, 0) * len(time_list) * (1 + len(cell_batches)))
 
         for epoch in range(n_epochs):
             self.flow_model.train()
@@ -329,6 +383,7 @@ class DecoupledTrainer:
                 # 水动力 loss 已经覆盖全 active 河道；泥沙 loss 按 cell batch 分摊。
                 (flow_loss / len(time_list)).backward(retain_graph=False)
                 total_loss_value += float(flow_loss.detach().cpu()) / len(time_list)
+                progress.update(loss=total_loss_value)
                 for cell_batch in cell_batches:
                     sediment_loss, _ = self.sediment_transport_loss_fn.compute_sediment_loss(
                         self.sediment_model,
@@ -342,6 +397,7 @@ class DecoupledTrainer:
                     weight = 1.0 / (len(time_list) * len(cell_batches))
                     (sediment_loss * weight).backward()
                     total_loss_value += float(sediment_loss.detach().cpu()) * weight
+                    progress.update(loss=total_loss_value)
 
             torch.nn.utils.clip_grad_norm_(
                 list(self.flow_model.parameters()) + list(self.sediment_model.parameters()),
@@ -352,6 +408,7 @@ class DecoupledTrainer:
                 self.joint_scheduler.step(total_loss_value)
             self.history['joint_loss'].append(total_loss_value)
 
+        progress.close(loss=total_loss_value)
         return total_loss_value
 
     def _compute_real_flow_boundary_loss(self, payload):
