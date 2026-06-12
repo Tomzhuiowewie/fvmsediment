@@ -12,7 +12,6 @@ physics:
   include_time_terms: true
   simulation_time: 2937600  # 总模拟时间（秒）；对应 Excel 过程线约 34 天
   sample_dt: 86400  # 训练采样时间间隔（秒）；当前按每天一个训练时刻
-  morph_dt: 86400  # 级配显式更新时间间隔（秒）
   output_dt: 86400  # 结果输出时间间隔（秒）
 
   flow:
@@ -50,7 +49,10 @@ physics:
 training:
   flow_epochs: 200
   sediment_epochs: 100
-  joint_epochs: 50
+  joint_epochs: 50  # 全部耦合迭代合计的联合训练 epoch
+  coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
+  coupling_relaxation: 0.3  # 床面和级配固定点松弛系数
+  coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
   flow_loss_tol: 0.0  # >0 时，水动力 loss 低于该值提前停止
   sediment_loss_tol: 0.0  # >0 时，泥沙 loss 低于该值提前停止
   joint_loss_tol: 0.0  # >0 时，联合 loss 低于该值提前停止

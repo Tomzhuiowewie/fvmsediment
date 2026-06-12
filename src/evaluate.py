@@ -17,7 +17,17 @@ except ImportError:
     HAS_MATPLOTLIB = False
 
 
-def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_time, case_name='default', output_dir=None):
+def visualize_results(
+    mesh,
+    bed_history,
+    bbox,
+    resolution,
+    history,
+    simulation_time,
+    case_name='default',
+    output_dir=None,
+    run_timestamp=None,
+):
     if not HAS_MATPLOTLIB:
         print("未安装 matplotlib，跳过绘图。")
         return
@@ -26,7 +36,7 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_t
         os.makedirs(output_dir, exist_ok=True)
 
     plot_context = _prepare_plot_context(mesh, bed_history, bbox, resolution, history, simulation_time)
-    save_path = _make_save_path(case_name, output_dir)
+    save_path = _make_save_path(case_name, output_dir, run_timestamp)
 
     plot_bed_evolution(bed_history, plot_context, save_path('bed'))
     plot_bed_profiles(bed_history, plot_context, save_path('profiles'))
@@ -42,9 +52,10 @@ def visualize_results(mesh, bed_history, bbox, resolution, history, simulation_t
     print(f'  Peak change: {dz:+.4f}m ({dz / max(initial_peak, EPS_SAFE) * 100:.1f}%)')
 
 
-def _make_save_path(case_name, output_dir):
+def _make_save_path(case_name, output_dir, run_timestamp=None):
     def _save_path(name):
-        path = f'{case_name}_{name}.png'
+        suffix = f'_{run_timestamp}' if run_timestamp else ''
+        path = f'{case_name}_{name}{suffix}.png'
         return os.path.join(output_dir, path) if output_dir else path
 
     return _save_path

@@ -84,7 +84,7 @@ class FVMeshPreprocessor:
         elif callable(initial_bed):
             self.zb = initial_bed(self.cell_centers_x, self.cell_centers_y)
         else:
-            bed_array = np.asarray(initial_bed, dtype=np.float32)
+            bed_array = np.asarray(initial_bed, dtype=np.float64)
             if bed_array.shape == (self.ny, self.nx):
                 self.zb = bed_array.reshape(-1)
             elif bed_array.size == self.n_cells:
@@ -167,7 +167,13 @@ class FVMeshPreprocessor:
                     idx += 1
 
     def update_bed(self, new_zb):
-        self.zb = np.clip(np.array(new_zb), -5.0, 5.0)
+        """更新当前绝对床面高程，保留初始床面用于累计变化诊断。"""
+        bed = np.asarray(new_zb, dtype=np.float64).reshape(-1)
+        if bed.size != self.n_cells:
+            raise ValueError("new_zb 的单元数必须与 FVM 网格一致。")
+        if not np.all(np.isfinite(bed)):
+            raise ValueError("new_zb 包含 NaN 或 Inf。")
+        self.zb = bed
 
     def get_bed_gradient(self,device):
         """用中心差分计算床面坡度 ∂zb/∂x 和 ∂zb/∂y。"""
@@ -374,7 +380,8 @@ class RealBoundaryConditionBuilder:
             'inlet_weights': self.inlet['weights'],
             'target_flow': q,
             'outlet_coords': self._coords_with_time(self.outlet['coords_norm'], t_norm),
-            'outlet_bed': self.outlet['bed'],
+            # 床面在联合形态步中会更新，下游目标水深必须使用当前出口床高。
+            'outlet_bed': self.mesh.zb[self.outlet['cell_ids']].astype(np.float32),
             'target_stage': stage,
             'typical_depth': self.typical_depth,
             'typical_velocity': self.typical_velocity,
@@ -416,7 +423,7 @@ class RealBoundaryConditionBuilder:
         return {
             'coords_norm': coords_norm,
             'weights': np.full(cols.size, self.mesh.resolution, dtype=np.float32),
-            'bed': self.mesh.zb_initial[cell_ids].astype(np.float32),
+            'cell_ids': np.asarray(cell_ids, dtype=np.int64),
         }
 
     @staticmethod

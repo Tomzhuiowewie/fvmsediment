@@ -1,6 +1,6 @@
 # train.py - 三阶段 PINN 训练流程
 # 阶段 1：只训练水动力 PINN；阶段 2：冻结水动力训练泥沙 PINN；
-# 阶段 3：两个网络联合优化。床面历史由泥沙网络输出的 Δzb 生成。
+# 阶段 3：全时域 DEM-水动力-泥沙固定点耦合与联合优化。
 
 import numpy as np
 import os
@@ -69,7 +69,7 @@ class DecoupledTrainer:
     这里不直接求解传统数值格式，而是把 PDE、边界条件和床变方程写成 loss：
     1. 先训练 flow_model，使 h/u/v 满足浅水方程和真实边界；
     2. 冻结 flow_model，训练 sediment_model 的 C_k 和 Δzb；
-    3. 最后两个网络联合优化，减少分阶段训练带来的不一致。
+    3. 全时域更新 DEM/级配，并联合优化两个网络直到耦合收敛。
     """
     def __init__(
         self,
@@ -90,6 +90,10 @@ class DecoupledTrainer:
         joint_loss_tol=0.0,
         early_stop_patience=0,
         early_stop_min_delta=0.0,
+        coupling_iterations=5,
+        coupling_relaxation=0.3,
+        coupling_bed_tol=1.0e-5,
+        run_timestamp=None,
         checkpoint_dir=None,
     ):
         self.flow_model = flow_model
@@ -106,10 +110,15 @@ class DecoupledTrainer:
         self.joint_loss_tol = float(joint_loss_tol or 0.0)
         self.early_stop_patience = int(early_stop_patience or 0)
         self.early_stop_min_delta = float(early_stop_min_delta or 0.0)
+        self.coupling_iterations = max(int(coupling_iterations), 1)
+        self.coupling_relaxation = float(np.clip(coupling_relaxation, 1.0e-6, 1.0))
+        self.coupling_bed_tol = max(float(coupling_bed_tol), 0.0)
+        self.run_timestamp = str(run_timestamp) if run_timestamp else None
         self.checkpoint_dir = checkpoint_dir
         # active_layer_frac 是每个网格单元的活动层分级比例 p_k。
-        # 初始值来自 Excel 主河道级配，后续按 morph_dt 用 Exner 床变速率显式更新。
+        # 初始值来自 Excel 主河道级配，阶段 3 按全时域累计分粒径床变更新。
         self.active_layer_frac = self._init_gradation(initial_gradation)
+        self.initial_active_layer_frac = self.active_layer_frac.copy()
         # 固壁边界：active 河道单元与 inactive/外部相邻的边。
         # top 入口和 bottom 出口会被排除，不施加 no-flux。
         self.wall_gauss_mask = self._build_wall_gauss_mask()
@@ -140,6 +149,7 @@ class DecoupledTrainer:
         )
 
         self.history = {
+            'run_timestamp': self.run_timestamp,
             'flow_loss': [],
             'sediment_loss': [],
             'joint_loss': [],
@@ -161,6 +171,11 @@ class DecoupledTrainer:
             'Ceq_mean': [],
             'p_min': [],
             'p_max': [],
+            'coupling_bed_error': [],
+            'coupling_dzb_min': [],
+            'coupling_dzb_max': [],
+            'coupling_joint_loss': [],
+            'final_projection_error': [],
             'diagnostic_time': [],
             'q_in_target': [],
             'q_in_model': [],
@@ -185,7 +200,8 @@ class DecoupledTrainer:
         if not self.checkpoint_dir:
             return
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        path = os.path.join(self.checkpoint_dir, f'{name}.pt')
+        suffix = f'_{self.run_timestamp}' if self.run_timestamp else ''
+        path = os.path.join(self.checkpoint_dir, f'{name}{suffix}.pt')
         payload = {
             'flow_model': self.flow_model.state_dict(),
             'sediment_model': self.sediment_model.state_dict() if self.sediment_model is not None else None,
@@ -199,8 +215,10 @@ class DecoupledTrainer:
                 if self.joint_optimizer is not None else None
             ),
             'active_layer_frac': self.active_layer_frac,
+            'mesh_zb': self.mesh.zb,
             'history': self.history,
             'simulation_time': self.simulation_time,
+            'run_timestamp': self.run_timestamp,
         }
         torch.save(payload, path)
         print(f"  checkpoint saved: {path}")
@@ -608,7 +626,7 @@ class DecoupledTrainer:
         return times
 
     def predict_bed_history(self, output_times):
-        """在输出时刻预测床面历史。
+        """仅用于对比网络累计床变输出，不参与正式形态推进。
 
         sediment_model 直接输出累计床变 Δzb(x,y,t)，因此床面为：
         zb(t) = zb_initial + Δzb(t)。
@@ -631,44 +649,133 @@ class DecoupledTrainer:
             bed_history.append((self.mesh.zb_initial + dzb).astype(np.float32))
         return bed_history
 
-    def update_gradation_history(self, morph_times):
-        """按 morph_dt 显式更新活动层级配。
-
-        这里采用轻量活动层守恒更新：Exner 给出各粒径床变速率 dzb_dt_k，
-        乘以 morph_dt 后改变活动层内各粒径体积分数。该更新用于后续时间段
-        的输沙闭合，不直接反向传播；它和绘图输出 output_dt 解耦。
-        """
-        if len(morph_times) < 2:
-            return
+    def _exner_rate_field(self, t_norm):
+        """计算一个全局时刻所有活动单元的分粒径 Exner 床变率。"""
         self.flow_model.eval()
         self.sediment_model.eval()
-        for t0, t1 in zip(morph_times[:-1], morph_times[1:]):
-            t_norm = float(t1) / max(self.simulation_time, 1.0e-12)
-            dt = float(t1 - t0)
-            active = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
-            updated = self.active_layer_frac.copy()
-            for cell_batch in self._active_cell_batches(self.sediment_cell_batch_size):
-                p_k_gauss = self._gradation_at_gauss_tensor()
-                closure = self.sediment_transport_loss_fn.compute_closure(
-                    self.sediment_model,
-                    self.flow_model,
-                    t_norm,
-                    self.device,
-                    p_k_override=p_k_gauss,
-                    freeze_flow_params=True,
-                    cell_indices=cell_batch,
-                )
-                dzb_dt_k = self.sediment_transport_loss_fn.exner_dzb_dt_k_cell(closure)
-                # dzb_dt_k 是各粒径组对床变的贡献；除以活动层厚度后近似转成比例变化。
-                delta_frac = dzb_dt_k.detach().cpu().numpy() * dt / max(self.active_layer_thickness, 1.0e-6)
-                updated[cell_batch] = np.clip(updated[cell_batch] + delta_frac, 1.0e-8, None)
-            # 只更新河道活动单元；非河道单元的级配不参与物理计算。
-            updated[active] = updated[active] / np.sum(updated[active], axis=1, keepdims=True)
-            self.active_layer_frac = updated.astype(np.float32)
-            self.history['p_min'].append(float(np.min(self.active_layer_frac[active])))
-            self.history['p_max'].append(float(np.max(self.active_layer_frac[active])))
+        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
+        rate = np.zeros((self.mesh.n_cells, n_grains), dtype=np.float64)
 
-    def record_diagnostics(self, output_times, bc_builder):
+        for cell_batch in self._active_cell_batches(self.sediment_cell_batch_size):
+            p_k_gauss = self._gradation_at_gauss_tensor()
+            closure = self.sediment_transport_loss_fn.compute_closure(
+                self.sediment_model,
+                self.flow_model,
+                t_norm,
+                self.device,
+                p_k_override=p_k_gauss,
+                freeze_flow_params=True,
+                cell_indices=cell_batch,
+            )
+            rate[cell_batch] = (
+                self.sediment_transport_loss_fn.exner_dzb_dt_k_cell(closure)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+        return rate
+
+    def integrate_exner_history(self, times_norm, return_history=False):
+        """在全时域上用梯形法积分分粒径 Exner 床变率。
+
+        每次耦合迭代都从零累计床变，因此不会把耦合迭代次数误当成物理时间。
+        """
+        times_norm = np.asarray(times_norm, dtype=np.float64).ravel()
+        if times_norm.size == 0:
+            raise ValueError("Exner 积分至少需要一个时间点。")
+        if np.any(np.diff(times_norm) < 0.0):
+            raise ValueError("Exner 积分时间点必须单调递增。")
+
+        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
+        cumulative_k = np.zeros((self.mesh.n_cells, n_grains), dtype=np.float64)
+        bed_history = []
+        gradation_history = []
+        previous_rate = None
+        previous_time = None
+
+        for t_norm in times_norm:
+            current_rate = self._exner_rate_field(float(t_norm))
+            physical_time = float(t_norm) * self.simulation_time
+            if previous_rate is not None:
+                dt = physical_time - previous_time
+                cumulative_k += 0.5 * (previous_rate + current_rate) * dt
+
+            if return_history:
+                bed, fractions = self._state_from_cumulative_bed_change(cumulative_k)
+                bed_history.append(bed)
+                gradation_history.append(fractions)
+
+            previous_rate = current_rate
+            previous_time = physical_time
+
+        return cumulative_k, bed_history, gradation_history
+
+    def _state_from_cumulative_bed_change(self, cumulative_k):
+        """由全时域累计分粒径床变构造绝对床面和活动层级配。"""
+        active = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
+        bed = self.mesh.zb_initial.astype(np.float64).copy()
+        bed[active] += np.sum(cumulative_k[active], axis=1)
+
+        fractions = self.initial_active_layer_frac.astype(np.float64).copy()
+        fractions[active] = np.clip(
+            fractions[active]
+            + cumulative_k[active] / max(self.active_layer_thickness, 1.0e-6),
+            1.0e-8,
+            None,
+        )
+        fractions[active] /= np.sum(fractions[active], axis=1, keepdims=True)
+        return bed, fractions.astype(np.float32)
+
+    def apply_coupled_state(self, cumulative_k, relaxation=None):
+        """松弛更新当前 DEM 和级配，返回本轮最大床面改变量。"""
+        omega = self.coupling_relaxation if relaxation is None else float(relaxation)
+        omega = float(np.clip(omega, 1.0e-6, 1.0))
+        active = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
+        candidate_bed, candidate_frac = self._state_from_cumulative_bed_change(cumulative_k)
+
+        old_bed = self.mesh.zb.copy()
+        new_bed = old_bed.copy()
+        new_bed[active] = (
+            (1.0 - omega) * old_bed[active]
+            + omega * candidate_bed[active]
+        )
+
+        new_frac = self.active_layer_frac.astype(np.float64).copy()
+        new_frac[active] = (
+            (1.0 - omega) * new_frac[active]
+            + omega * candidate_frac[active]
+        )
+        new_frac[active] = np.clip(new_frac[active], 1.0e-8, None)
+        new_frac[active] /= np.sum(new_frac[active], axis=1, keepdims=True)
+
+        bed_error = float(np.max(np.abs(new_bed[active] - old_bed[active])))
+        self.mesh.update_bed(new_bed)
+        self.active_layer_frac = new_frac.astype(np.float32)
+        total_dzb = np.sum(cumulative_k[active], axis=1)
+        self.history['coupling_bed_error'].append(bed_error)
+        self.history['coupling_dzb_min'].append(float(np.min(total_dzb)))
+        self.history['coupling_dzb_max'].append(float(np.max(total_dzb)))
+        self.history['p_min'].append(float(np.min(self.active_layer_frac[active])))
+        self.history['p_max'].append(float(np.max(self.active_layer_frac[active])))
+        return bed_error
+
+    @staticmethod
+    def _joint_epoch_schedule(total_epochs, n_iterations):
+        """把联合训练总 epoch 数尽量均匀地分配到各耦合迭代。"""
+        if n_iterations <= 0:
+            return []
+        total_epochs = max(int(total_epochs), 0)
+        base, remainder = divmod(total_epochs, n_iterations)
+        return [base + (1 if i < remainder else 0) for i in range(n_iterations)]
+
+    def record_diagnostics(
+        self,
+        output_times,
+        bc_builder,
+        bed_history=None,
+        gradation_history=None,
+    ):
         """在输出时刻记录物理诊断量，便于判断结果是否可信。"""
         active_cell = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
         active_gauss = active_cell[self.mesh.gauss_cell_id]
@@ -679,7 +786,13 @@ class DecoupledTrainer:
         if self.sediment_model is not None:
             self.sediment_model.eval()
 
-        for t in output_times:
+        final_bed = self.mesh.zb.copy()
+        final_gradation = self.active_layer_frac.copy()
+        for i, t in enumerate(output_times):
+            if bed_history is not None:
+                self.mesh.update_bed(bed_history[i])
+            if gradation_history is not None:
+                self.active_layer_frac = gradation_history[i].copy()
             t_norm = float(t) / max(self.simulation_time, 1.0e-12)
             payload = bc_builder(t_norm)
             # 边界诊断检查模型是否真的满足真实 Q(t) 和 stage(t)。
@@ -694,6 +807,8 @@ class DecoupledTrainer:
             self.history['stage_out_model'].append(boundary_diag['stage_model'])
             for key, value in field_diag.items():
                 self.history[key].append(value)
+        self.mesh.update_bed(final_bed)
+        self.active_layer_frac = final_gradation
 
     def _flow_boundary_diagnostics(self, payload):
         inlet_coords = torch.tensor(payload['inlet_coords'], dtype=torch.float32, device=self.device)
@@ -834,7 +949,6 @@ class DecoupledTrainer:
         self,
         simulation_time,
         sample_dt,
-        morph_dt,
         output_dt,
         flow_epochs,
         sediment_epochs,
@@ -844,8 +958,7 @@ class DecoupledTrainer:
     ):
         """执行完整训练流程。
 
-        sample_dt 控制训练约束时间点；
-        morph_dt 控制级配显式更新时间；
+        sample_dt 控制全时域训练和 Exner 积分时间点；
         output_dt 只控制床面历史和图像输出时间。
         """
 
@@ -875,25 +988,84 @@ class DecoupledTrainer:
             print('\n阶段 3/3: 联合优化水动力 PINN 和泥沙 PINN')
         self.save_checkpoint('phase2_sediment')
 
+        # 阶段 3：不划分形态窗口。每轮先由当前模型在全时域积分床变并更新
+        # DEM/级配，再在更新后的 DEM 上使用全部时间点联合优化两个网络。
         joint_epochs = int(getattr(self, 'joint_epochs', 0))
-        joint_loss = self.train_joint_phase(joint_epochs, T_norm_list, data_coords=bc_builder)
+        epoch_schedule = self._joint_epoch_schedule(
+            joint_epochs,
+            self.coupling_iterations,
+        )
+        joint_loss = 0.0
+        completed_iterations = 0
+        for iteration, iteration_epochs in enumerate(epoch_schedule, start=1):
+            cumulative_k, _, _ = self.integrate_exner_history(T_norm_list)
+            bed_error = self.apply_coupled_state(cumulative_k)
+            if verbose:
+                print(
+                    f'\n耦合迭代 {iteration}/{len(epoch_schedule)}: '
+                    f'bed_error={bed_error:.3e}m, joint_epochs={iteration_epochs}'
+                )
+            if iteration_epochs > 0:
+                joint_loss = self.train_joint_phase(
+                    iteration_epochs,
+                    T_norm_list,
+                    data_coords=bc_builder,
+                )
+            self.history['coupling_joint_loss'].append(float(joint_loss))
+            completed_iterations = iteration
+            if self.coupling_bed_tol > 0.0 and bed_error <= self.coupling_bed_tol:
+                self.history['stop_reason']['coupling'] = (
+                    f"coupling: bed error {bed_error:.3e} <= "
+                    f"tol {self.coupling_bed_tol:.3e}"
+                )
+                if verbose:
+                    print(f"  耦合收敛: {self.history['stop_reason']['coupling']}")
+                break
         self.save_checkpoint('phase3_joint')
 
-        # 训练完成后再统一生成床面历史、更新级配历史和记录诊断。
-        # 目前床面历史来自网络预测 Δzb；级配更新是后处理式显式更新。
-        morph_times = self._output_times(simulation_time, morph_dt)
+        # 用最终联合模型重新积分，生成正式床面和级配历史。积分节点取训练
+        # 时间点与输出时间点的并集，避免 output_dt 较大时降低积分精度。
         output_times = self._output_times(simulation_time, output_dt)
-        bed_history = self.predict_bed_history(output_times)
-        self.update_gradation_history(morph_times)
-        self.record_diagnostics(output_times, bc_builder)
-        self.history['morph_times'] = morph_times
+        sample_times = np.asarray(T_norm_list, dtype=np.float64) * self.simulation_time
+        integration_times = np.unique(np.concatenate([
+            sample_times,
+            np.asarray(output_times, dtype=np.float64),
+        ]))
+        integration_times_norm = (
+            integration_times / max(self.simulation_time, 1.0e-12)
+        )
+        _, integrated_beds, integrated_fractions = self.integrate_exner_history(
+            integration_times_norm,
+            return_history=True,
+        )
+        output_indices = np.searchsorted(
+            integration_times,
+            np.asarray(output_times, dtype=np.float64),
+        )
+        bed_history = [integrated_beds[i] for i in output_indices]
+        gradation_history = [integrated_fractions[i] for i in output_indices]
+        active = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
+        projection_error = float(np.max(np.abs(
+            bed_history[-1][active] - self.mesh.zb[active]
+        )))
+        self.history['final_projection_error'].append(projection_error)
+        self.mesh.update_bed(bed_history[-1])
+        self.active_layer_frac = gradation_history[-1].copy()
+        self.record_diagnostics(
+            output_times,
+            bc_builder,
+            bed_history=bed_history,
+            gradation_history=gradation_history,
+        )
+        self.history['integration_times'] = integration_times.tolist()
+        self.history['coupling_iterations_completed'] = completed_iterations
         self.history['output_times'] = output_times
         self.history['zb_min'] = [float(np.min(zb)) for zb in bed_history]
         self.history['zb_max'] = [float(np.max(zb)) for zb in bed_history]
 
         if verbose:
             print(f'阶段 3 完成: Joint Loss={joint_loss:.2e}')
-            print(f'级配更新时间点: {morph_times}')
+            print(f'完成耦合迭代: {completed_iterations}')
             print(f'输出时间点: {output_times}')
             self.print_diagnostic_summary()
 

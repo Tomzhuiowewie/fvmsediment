@@ -20,7 +20,6 @@ class SimulationConfig:
     include_time_terms: bool
     simulation_time: float
     sample_dt: float
-    morph_dt: float
     output_dt: float
     typical_depth: float
     typical_velocity: float
@@ -76,7 +75,6 @@ def load_config(path) -> SimulationConfig:
         include_time_terms=bool(physics['include_time_terms']),
         simulation_time=float(physics['simulation_time']),
         sample_dt=float(physics['sample_dt']),
-        morph_dt=float(physics.get('morph_dt', physics.get('output_dt', physics['sample_dt']))),
         output_dt=float(physics['output_dt']),
         typical_depth=float(flow['typical_depth']),
         typical_velocity=typical_velocity,

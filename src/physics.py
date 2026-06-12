@@ -489,8 +489,8 @@ class SedimentTransportLoss(_CachedMeshTensors):
     def exner_dzb_dt_gauss(self, closure):
         """根据当前闭合量计算高斯点上的 Exner 床变速率。
 
-        这个量不直接更新 mesh.zb，而是作为 Δzb 网络输出的物理约束：
-        d(Δzb)/dt 应接近 Exner 预测的床变速率。
+        该量既约束网络输出 d(Δzb)/dt，也由训练器在全时域积分后用于
+        DEM-水动力-泥沙固定点耦合。
         """
         dzb_dt_k_cell = self.exner_dzb_dt_k_cell(closure)
         npp = self.mesh.n_points_per_cell
