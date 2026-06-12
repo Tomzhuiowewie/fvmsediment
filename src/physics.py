@@ -82,7 +82,10 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
 
     def __init__(self, fvm_mesh, g=9.81, n_manning=0.01, bounds=None,
                  typical_depth=10.0, typical_velocity=1.0,
-                 simulation_time=1.0, include_time_terms=True, eps=EPS_SAFE):
+                 simulation_time=1.0, include_time_terms=True,
+                 adaptive_weighting=True, adaptive_weight_ema_decay=0.95,
+                 adaptive_weight_min=0.05, adaptive_weight_max=20.0,
+                 eps=EPS_SAFE):
         self.mesh = fvm_mesh
         self.g = g
         self.n = n_manning
@@ -91,6 +94,17 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         self.typical_u = typical_velocity
         self.simulation_time = simulation_time
         self.include_time_terms = include_time_terms
+        self.adaptive_weighting = bool(adaptive_weighting)
+        self.adaptive_weight_ema_decay = float(
+            np.clip(adaptive_weight_ema_decay, 0.0, 0.9999)
+        )
+        self.adaptive_weight_min = max(float(adaptive_weight_min), EPS_DIVISION)
+        self.adaptive_weight_max = max(
+            float(adaptive_weight_max),
+            self.adaptive_weight_min,
+        )
+        self._flow_loss_ema = None
+        self._flow_loss_weights = np.ones(3, dtype=np.float64)
         self.eps = eps
         cell_area = fvm_mesh.cell_area
         cell_perimeter = 4.0 * fvm_mesh.resolution
@@ -111,6 +125,35 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         self.continuity_scale = 1.0 / max(continuity_scale, EPS_DIVISION)
         self.momentum_scale = 1.0 / max(momentum_scale, EPS_DIVISION)
         self._init_cache(fvm_mesh)
+
+    def _adaptive_weights(self, losses):
+        """根据原始损失 EMA 的逆量级生成均值为 1 的 detached 权重。"""
+        values = np.asarray(
+            [float(loss.detach().cpu()) for loss in losses],
+            dtype=np.float64,
+        )
+        values = np.maximum(values, EPS_DIVISION)
+        if self._flow_loss_ema is None:
+            self._flow_loss_ema = values
+        else:
+            decay = self.adaptive_weight_ema_decay
+            self._flow_loss_ema = decay * self._flow_loss_ema + (1.0 - decay) * values
+
+        if not self.adaptive_weighting:
+            self._flow_loss_weights = np.ones_like(values)
+            return self._flow_loss_weights
+
+        inverse = 1.0 / np.maximum(self._flow_loss_ema, EPS_DIVISION)
+        weights = inverse / np.mean(inverse)
+        weights = np.clip(
+            weights,
+            self.adaptive_weight_min,
+            self.adaptive_weight_max,
+        )
+        # 截断后再次归一化，保持三个 PDE 分量的平均权重为 1。
+        weights = weights / np.mean(weights)
+        self._flow_loss_weights = weights
+        return weights
 
     def compute_loss(self, model, t, device):
         """计算 SVEs 物理损失。
@@ -215,11 +258,27 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         mom_y_res = (vol_my + bnd_my - slope_y + fric_ty) * self.momentum_scale
         loss_momentum_y = torch.mean(mom_y_res ** 2)
 
-        total_loss = loss_continuity + loss_momentum_x + loss_momentum_y
+        weights = self._adaptive_weights(
+            [loss_continuity, loss_momentum_x, loss_momentum_y]
+        )
+        weighted_continuity = loss_continuity * float(weights[0])
+        weighted_momentum_x = loss_momentum_x * float(weights[1])
+        weighted_momentum_y = loss_momentum_y * float(weights[2])
+        total_loss = (
+            weighted_continuity
+            + weighted_momentum_x
+            + weighted_momentum_y
+        )
         loss_dict = {
             'continuity': loss_continuity.item(),
             'momentum_x': loss_momentum_x.item(),
             'momentum_y': loss_momentum_y.item(),
+            'weighted_continuity': weighted_continuity.item(),
+            'weighted_momentum_x': weighted_momentum_x.item(),
+            'weighted_momentum_y': weighted_momentum_y.item(),
+            'weight_continuity': float(weights[0]),
+            'weight_momentum_x': float(weights[1]),
+            'weight_momentum_y': float(weights[2]),
             'total': total_loss.item(),
         }
         return total_loss, loss_dict

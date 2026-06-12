@@ -25,6 +25,10 @@ class SimulationConfig:
     typical_velocity: float
     g: float
     n_manning: float
+    adaptive_flow_weighting: bool
+    flow_weight_ema_decay: float
+    flow_weight_min: float
+    flow_weight_max: float
     grain_diameters: List[float]
     beta_default: float
     epsilon_default: float
@@ -80,6 +84,10 @@ def load_config(path) -> SimulationConfig:
         typical_velocity=typical_velocity,
         g=float(flow.get('g', 9.81)),
         n_manning=float(flow.get('n_manning', 0.01)),
+        adaptive_flow_weighting=bool(flow.get('adaptive_loss_weighting', True)),
+        flow_weight_ema_decay=float(flow.get('adaptive_weight_ema_decay', 0.95)),
+        flow_weight_min=float(flow.get('adaptive_weight_min', 0.05)),
+        flow_weight_max=float(flow.get('adaptive_weight_max', 20.0)),
         grain_diameters=grain_diameters,
         beta_default=float(sediment.get('beta_default', 1.0)),
         epsilon_default=float(sediment.get('epsilon_default', 0.1)),

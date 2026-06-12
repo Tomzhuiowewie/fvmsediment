@@ -41,6 +41,7 @@ def visualize_results(
     plot_bed_evolution(bed_history, plot_context, save_path('bed'))
     plot_bed_profiles(bed_history, plot_context, save_path('profiles'))
     plot_training_history(history, plot_context, simulation_time, save_path('losses'))
+    plot_flow_adaptive_weights(history, save_path('flow_weights'))
 
     active_mask = plot_context.get('active_mask')
     z0 = _mask_bed(bed_history[0].reshape(plot_context['ny'], plot_context['nx']), active_mask)
@@ -189,6 +190,7 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
 
     pl(axes[0, 0], history.get('flow_loss', []), 'Flow', 'b')
     pl(axes[0, 0], history.get('continuity', []), 'Cont', 'c', '--')
+    pl(axes[0, 0], history.get('flow_boundary_loss', []), 'Boundary raw', 'gray', ':')
     axes[0, 0].set_title('Flow Loss')
     axes[0, 0].legend(fontsize=8)
     axes[0, 0].grid(alpha=0.3)
@@ -246,6 +248,57 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
         axes[2, 1].grid(alpha=0.3)
 
     plt.suptitle('Training History')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'✓ {save_path}')
+
+
+def plot_flow_adaptive_weights(history, save_path):
+    raw_keys = (
+        ('continuity', 'Continuity', 'c'),
+        ('momentum_x', 'Momentum-x', 'r'),
+        ('momentum_y', 'Momentum-y', 'm'),
+        ('flow_boundary_loss', 'Boundary', 'gray'),
+    )
+    weighted_keys = (
+        ('weighted_continuity', 'Continuity weighted', 'c'),
+        ('weighted_momentum_x', 'Momentum-x weighted', 'r'),
+        ('weighted_momentum_y', 'Momentum-y weighted', 'm'),
+        ('weighted_flow_boundary', 'Boundary weighted', 'gray'),
+    )
+    weight_keys = (
+        ('weight_continuity', 'w continuity', 'c'),
+        ('weight_momentum_x', 'w momentum-x', 'r'),
+        ('weight_momentum_y', 'w momentum-y', 'm'),
+        ('flow_boundary_weight', 'w boundary', 'gray'),
+    )
+    if not any(history.get(key) for key, _, _ in weight_keys):
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    for key, label, color in raw_keys:
+        values = history.get(key, [])
+        if values:
+            axes[0].semilogy(values, color=color, lw=1.5, label=label)
+    axes[0].set_title('Raw Flow Loss Components')
+
+    for key, label, color in weighted_keys:
+        values = history.get(key, [])
+        if values:
+            axes[1].semilogy(values, color=color, lw=1.5, label=label)
+    axes[1].set_title('Weighted Flow Loss Components')
+
+    for key, label, color in weight_keys:
+        values = history.get(key, [])
+        if values:
+            axes[2].semilogy(values, color=color, lw=1.5, label=label)
+    axes[2].set_title('Adaptive Flow Weights')
+
+    for ax in axes:
+        ax.set_xlabel('Epoch')
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()

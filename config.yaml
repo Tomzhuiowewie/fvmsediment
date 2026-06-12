@@ -19,6 +19,10 @@ physics:
     typical_velocity: 1.0
     g: 9.81
     n_manning: 0.01  # 曼宁糙率
+    adaptive_loss_weighting: true  # 自适应平衡连续方程与两个动量方程
+    adaptive_weight_ema_decay: 0.95  # 原始损失量级的指数滑动平均系数
+    adaptive_weight_min: 0.05  # 单项权重下限
+    adaptive_weight_max: 20.0  # 单项权重上限
 
   sediment:
     grain_diameters: [0.00025, 0.0005, 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128]
@@ -53,6 +57,11 @@ training:
   coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
   coupling_relaxation: 0.3  # 床面和级配固定点松弛系数
   coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
+  flow_boundary_weight: 0.5  # 关闭边界自适应时使用的固定系数
+  adaptive_boundary_weighting: true  # 动态平衡边界损失与水动力 PDE 总损失
+  boundary_weight_ema_decay: 0.95
+  boundary_weight_min: 0.0001
+  boundary_weight_max: 1.0
   flow_loss_tol: 0.0  # >0 时，水动力 loss 低于该值提前停止
   sediment_loss_tol: 0.0  # >0 时，泥沙 loss 低于该值提前停止
   joint_loss_tol: 0.0  # >0 时，联合 loss 低于该值提前停止

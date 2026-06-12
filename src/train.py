@@ -93,6 +93,11 @@ class DecoupledTrainer:
         coupling_iterations=5,
         coupling_relaxation=0.3,
         coupling_bed_tol=1.0e-5,
+        flow_boundary_weight=0.5,
+        adaptive_boundary_weighting=True,
+        boundary_weight_ema_decay=0.95,
+        boundary_weight_min=1.0e-4,
+        boundary_weight_max=1.0,
         run_timestamp=None,
         checkpoint_dir=None,
     ):
@@ -113,6 +118,19 @@ class DecoupledTrainer:
         self.coupling_iterations = max(int(coupling_iterations), 1)
         self.coupling_relaxation = float(np.clip(coupling_relaxation, 1.0e-6, 1.0))
         self.coupling_bed_tol = max(float(coupling_bed_tol), 0.0)
+        self.flow_boundary_weight = max(float(flow_boundary_weight), 0.0)
+        self.adaptive_boundary_weighting = bool(adaptive_boundary_weighting)
+        self.boundary_weight_ema_decay = float(
+            np.clip(boundary_weight_ema_decay, 0.0, 0.9999)
+        )
+        self.boundary_weight_min = max(float(boundary_weight_min), 0.0)
+        self.boundary_weight_max = max(
+            float(boundary_weight_max),
+            self.boundary_weight_min,
+        )
+        self._physics_loss_ema = None
+        self._boundary_loss_ema = None
+        self._current_boundary_weight = self.flow_boundary_weight
         self.run_timestamp = str(run_timestamp) if run_timestamp else None
         self.checkpoint_dir = checkpoint_dir
         # active_layer_frac 是每个网格单元的活动层分级比例 p_k。
@@ -162,6 +180,15 @@ class DecoupledTrainer:
             'continuity': [],
             'momentum_x': [],
             'momentum_y': [],
+            'weighted_continuity': [],
+            'weighted_momentum_x': [],
+            'weighted_momentum_y': [],
+            'weight_continuity': [],
+            'weight_momentum_x': [],
+            'weight_momentum_y': [],
+            'flow_boundary_loss': [],
+            'flow_boundary_weight': [],
+            'weighted_flow_boundary': [],
             'zb_min': [],
             'zb_max': [],
             'C_min': [],
@@ -317,25 +344,47 @@ class DecoupledTrainer:
         for epoch in range(n_epochs):
             self.flow_optimizer.zero_grad()
             total_loss_value = 0.0
-            loss_acc = {'continuity': 0.0, 'momentum_x': 0.0, 'momentum_y': 0.0}
+            loss_keys = (
+                'continuity',
+                'momentum_x',
+                'momentum_y',
+                'weighted_continuity',
+                'weighted_momentum_x',
+                'weighted_momentum_y',
+                'weight_continuity',
+                'weight_momentum_x',
+                'weight_momentum_y',
+            )
+            loss_acc = {key: 0.0 for key in loss_keys}
+            boundary_loss_acc = 0.0
+            boundary_weight_acc = 0.0
+            weighted_boundary_acc = 0.0
             for t_i in time_list:
                 # 水动力阶段：浅水方程残差 + 真实边界（入口流量、出口水位）约束。
                 physics_loss, loss_dict = self.flow_loss_fn.compute_loss(self.flow_model, t_i, self.device)
                 boundary_loss = self._compute_real_flow_boundary_loss(bc_builder(t_i))
-                # 边界 loss 权重先固定为 0.5；后续如果 Q 或 stage 偏差大，可单独配置。
-                step_loss = physics_loss + 0.5 * boundary_loss
+                step_loss, boundary_weight = self._balance_flow_boundary_loss(
+                    physics_loss,
+                    boundary_loss,
+                )
                 (step_loss / len(time_list)).backward()
                 total_loss_value += float(step_loss.detach().cpu()) / len(time_list)
                 for key in loss_acc:
                     loss_acc[key] += loss_dict[key] / len(time_list)
+                boundary_value = float(boundary_loss.detach().cpu())
+                boundary_loss_acc += boundary_value / len(time_list)
+                boundary_weight_acc += boundary_weight / len(time_list)
+                weighted_boundary_acc += boundary_weight * boundary_value / len(time_list)
                 progress.update(loss=total_loss_value)
             torch.nn.utils.clip_grad_norm_(self.flow_model.parameters(), max_norm=1.0)
             self.flow_optimizer.step()
             self.flow_scheduler.step(total_loss_value)
             self.history['flow_loss'].append(total_loss_value)
-            self.history['continuity'].append(loss_acc['continuity'])
-            self.history['momentum_x'].append(loss_acc['momentum_x'])
-            self.history['momentum_y'].append(loss_acc['momentum_y'])
+            for key, value in loss_acc.items():
+                self.history[key].append(value)
+            self.history['flow_boundary_loss'].append(boundary_loss_acc)
+            self.history['flow_boundary_weight'].append(boundary_weight_acc)
+            self.history['weighted_flow_boundary'].append(weighted_boundary_acc)
             best_loss, stale_epochs, stop_reason = self._early_stop_check(
                 'flow', epoch, total_loss_value, best_loss, stale_epochs, self.flow_loss_tol
             )
@@ -485,7 +534,8 @@ class DecoupledTrainer:
             for t_i in time_list:
                 # 联合 loss = 水动力方程/边界 + 泥沙方程/床变约束。
                 flow_loss, _ = self.flow_loss_fn.compute_loss(self.flow_model, t_i, self.device)
-                flow_loss = flow_loss + 0.5 * self._compute_real_flow_boundary_loss(data_coords(t_i))
+                boundary_loss = self._compute_real_flow_boundary_loss(data_coords(t_i))
+                flow_loss, _ = self._balance_flow_boundary_loss(flow_loss, boundary_loss)
 
                 # 水动力 loss 已经覆盖全 active 河道；泥沙 loss 按 cell batch 分摊。
                 (flow_loss / len(time_list)).backward(retain_graph=False)
@@ -527,6 +577,36 @@ class DecoupledTrainer:
             progress.finish(loss=total_loss_value)
             print(f"  Early stop: {stop_reason}")
         return total_loss_value
+
+    def _balance_flow_boundary_loss(self, physics_loss, boundary_loss):
+        """使边界损失的加权贡献与水动力 PDE 总损失保持同量级。"""
+        physics_value = max(float(physics_loss.detach().cpu()), 1.0e-12)
+        boundary_value = max(float(boundary_loss.detach().cpu()), 1.0e-12)
+        if self._physics_loss_ema is None:
+            self._physics_loss_ema = physics_value
+            self._boundary_loss_ema = boundary_value
+        else:
+            decay = self.boundary_weight_ema_decay
+            self._physics_loss_ema = (
+                decay * self._physics_loss_ema
+                + (1.0 - decay) * physics_value
+            )
+            self._boundary_loss_ema = (
+                decay * self._boundary_loss_ema
+                + (1.0 - decay) * boundary_value
+            )
+
+        if self.adaptive_boundary_weighting:
+            weight = self._physics_loss_ema / max(self._boundary_loss_ema, 1.0e-12)
+            weight = float(np.clip(
+                weight,
+                self.boundary_weight_min,
+                self.boundary_weight_max,
+            ))
+        else:
+            weight = self.flow_boundary_weight
+        self._current_boundary_weight = weight
+        return physics_loss + weight * boundary_loss, weight
 
     def _compute_real_flow_boundary_loss(self, payload):
         """真实边界损失：入口总流量、出口水位、侧壁 no-flux。"""

@@ -105,6 +105,10 @@ def run_real_case(config_path="config.yaml"):
         typical_velocity=cfg.typical_velocity,
         simulation_time=cfg.simulation_time,
         include_time_terms=cfg.include_time_terms,
+        adaptive_weighting=cfg.adaptive_flow_weighting,
+        adaptive_weight_ema_decay=cfg.flow_weight_ema_decay,
+        adaptive_weight_min=cfg.flow_weight_min,
+        adaptive_weight_max=cfg.flow_weight_max,
     )
 
     sediment_transport_loss_fn = SedimentTransportLoss(
@@ -162,6 +166,11 @@ def run_real_case(config_path="config.yaml"):
         coupling_iterations=cfg.training.get('coupling_iterations', 5),
         coupling_relaxation=cfg.training.get('coupling_relaxation', 0.3),
         coupling_bed_tol=cfg.training.get('coupling_bed_tol', 1.0e-5),
+        flow_boundary_weight=cfg.training.get('flow_boundary_weight', 0.5),
+        adaptive_boundary_weighting=cfg.training.get('adaptive_boundary_weighting', True),
+        boundary_weight_ema_decay=cfg.training.get('boundary_weight_ema_decay', 0.95),
+        boundary_weight_min=cfg.training.get('boundary_weight_min', 1.0e-4),
+        boundary_weight_max=cfg.training.get('boundary_weight_max', 1.0),
         run_timestamp=run_timestamp,
         checkpoint_dir=checkpoint_dir,
     )

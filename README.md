@@ -485,11 +485,26 @@ p_{k,initial}+
 
 ```math
 L_{flow}=
-L_{continuity}
-+L_{momentum,x}
-+L_{momentum,y}
-+0.5L_{boundary}
+w_cL_{continuity}
++w_xL_{momentum,x}
++w_yL_{momentum,y}
++w_bL_{boundary}
 ```
+
+`w_c`、`w_x`、`w_y` 根据三个原始 PDE 损失的指数滑动平均值反比更新，并归一化为平均权重 1。这样连续方程和两个动量方程对反向传播的贡献保持在相近量级，同时保留原始损失用于诊断。
+
+边界权重 `w_b` 根据加权 PDE 总损失与边界原始损失的 EMA 比值更新：
+
+```math
+w_b=
+clip\left(
+\frac{EMA(L_{PDE})}{EMA(L_{boundary})},
+w_{b,min},
+w_{b,max}
+\right)
+```
+
+因此入口流量、出口水位或固壁损失较大时，不再固定以 `0.5` 压过 PDE 项。关闭 `adaptive_boundary_weighting` 后，才使用 `flow_boundary_weight` 的固定值。
 
 阶段结束保存 `phase1_flow_<timestamp>.pt`。
 
@@ -592,6 +607,8 @@ joint epochs            50
 耦合迭代                5
 耦合松弛系数            0.3
 床面收敛阈值            1e-5 m
+水动力 PDE 自适应权重   开启，EMA decay=0.95
+边界自适应权重          开启，范围 1e-4 至 1
 泥沙单元 batch          1024
 ```
 
@@ -661,6 +678,7 @@ outputs/
 ├── real_bed_<timestamp>.png
 ├── real_profiles_<timestamp>.png
 ├── real_losses_<timestamp>.png
+├── real_flow_weights_<timestamp>.png
 └── time_points_<timestamp>/
 ```
 
