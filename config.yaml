@@ -25,11 +25,12 @@ physics:
     adaptive_weight_max: 20.0  # 单项权重上限
 
   sediment:
-    grain_diameters: [0.00025, 0.0005, 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128]
+    # HEC-RAS FS-SC 粒径组的几何平均代表粒径，不是各组上界。
+    grain_diameters: [0.000177, 0.000354, 0.000707, 0.001414, 0.002828, 0.005657, 0.01131, 0.02263, 0.04525, 0.09051]
     beta_default: 1.0
     epsilon_default: 0.1
     residual_scale: 1.0
-    adaptation_length: 5
+    adaptation_length: 9.144
     rho_s: 2650.0
     rho_w: 1000.0
     kinematic_viscosity: 0.000001
@@ -55,7 +56,7 @@ training:
   sediment_epochs: 100
   joint_epochs: 50  # 全部耦合迭代合计的联合训练 epoch
   coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
-  coupling_relaxation: 0.3  # 床面和级配固定点松弛系数
+  coupling_relaxation: 0.25  # 床面和级配固定点松弛系数
   coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
   flow_boundary_weight: 0.5  # 关闭边界自适应时使用的固定系数
   adaptive_boundary_weighting: true  # 动态平衡边界损失与水动力 PDE 总损失

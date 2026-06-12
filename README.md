@@ -105,6 +105,12 @@ p_k = F_k - F_{k-1}
 初始时所有网格单元使用同一组主河道级配。只有活动河道单元参与后续闭合与更新。
 
 如果 `config.yaml` 中显式给出 `grain_diameters`，模型粒径组使用配置值；否则使用 Excel 粒径。
+当前配置按照 HEC-RAS 使用各粒径组的几何平均代表粒径，而不是粒径组上界：
+
+```text
+FS    MS    CS    VCS   VFG    FG     MG     CG     VCG    SC
+0.177 0.354 0.707 1.414 2.828  5.657  11.31  22.63  45.25  90.51 mm
+```
 
 当前活动层初始级配仍来自 Excel，因此配置粒径组数量必须与 Excel 转换后的有效级配组数量一致，否则训练器初始化会报错。
 
@@ -594,7 +600,7 @@ t_{norm}=\frac{t}{simulation\_time}
 总模拟时间              2,937,600 s，约 34 天
 训练采样间隔            86,400 s
 输出间隔                86,400 s
-粒径组                  0.25 至 128 mm，共 10 组
+粒径组代表粒径          0.177 至 90.51 mm，共 10 组
 Manning n               0.01
 典型水深                8 m
 典型流速                1 m/s
@@ -619,7 +625,7 @@ joint epochs            50
 建议使用包含以下依赖的 Python 环境：
 
 ```bash
-pip install numpy torch pyyaml pillow matplotlib
+pip install numpy torch pyyaml pillow matplotlib scipy pandas
 ```
 
 从项目根目录运行：
@@ -636,6 +642,66 @@ CUDA 可用 -> cuda
 ```
 
 真实 DEM 和多粒径自动微分计算量较大，正式运行建议使用 GPU。
+
+### 15.1 独立 PINN 推理
+
+训练完成后，可将最终 checkpoint 直接推理到 HEC-RAS 的 433 个单元中心和
+1633 个输出时刻：
+
+```bash
+python scripts/export_pinn_inference.py --device cpu
+```
+
+脚本默认从 `outputs-autodl/` 中选择修改时间最新的
+`final_checkpoint_<timestamp>.pt`，并读取同时间戳的
+`config_used_<timestamp>.yaml`。也可以显式指定：
+
+```bash
+python scripts/export_pinn_inference.py \
+  --checkpoint outputs-autodl/final_checkpoint_<timestamp>.pt \
+  --config outputs-autodl/config_used_<timestamp>.yaml \
+  --truth-dir data/Chippewa_2D/validation_truth \
+  --device cuda
+```
+
+推理字段的计算方式如下：
+
+- `h、u、v`：FlowPINN 在每个 HEC-RAS 单元中心和时刻直接计算。
+- 分组浓度：SedimentPINN 在相同坐标和时刻直接计算，再由体积浓度乘
+  `rho_s` 转为 `kg/m3`。
+- `bed_change_m`：直接取 SedimentPINN 的最后一个输出，即该位置、该时刻
+  相对初始床面的累计床变。
+- `bed_elevation_m`：初始 DEM 双线性插值值加 `bed_change_m`。
+- 输沙能力和床面剪应力：使用 PINN 的 `h、u、v` 重新调用 Wu 闭合计算。
+
+这里的河床结果不读取或重放 `training_results_<timestamp>.npz` 中的
+`bed_history`。因此导出的每个时刻河床完全由泥沙 PINN 的床变输出决定。
+
+### 15.2 与 HEC-RAS 对比
+
+推理完成后运行：
+
+```bash
+python scripts/compare_pinn_hecras.py
+```
+
+脚本默认选择 `outputs-autodl/` 中最新的 `pinn_inference_*` 目录。也可指定：
+
+```bash
+python scripts/compare_pinn_hecras.py \
+  --inference-dir outputs-autodl/pinn_inference_<timestamp> \
+  --truth-dir data/Chippewa_2D/validation_truth
+```
+
+误差统一定义为：
+
+```text
+error = PINN - HEC-RAS
+```
+
+汇总结果包括样本数、MAE、RMSE、平均偏差、最大绝对误差、R2 和真值均值。
+水位与水深只统计 HEC-RAS 湿单元，流速还要求
+`velocity_reconstruction_valid=1`。
 
 ## 16. 输出文件
 
@@ -710,6 +776,36 @@ bed_t_0001d_00h_0000086400s.npz
 
 目录内 `index.json` 记录模拟时间与文件名的对应关系。
 
+### 16.4 独立推理与对比结果
+
+独立推理输出到：
+
+```text
+outputs-autodl/pinn_inference_<timestamp>/
+├── pinn_hydrodynamics.csv
+├── pinn_hydrodynamics.npz
+├── pinn_sediment.csv
+├── pinn_sediment.npz
+├── pinn_bed.csv
+├── pinn_bed.npz
+├── metadata.json
+└── comparison/
+    ├── summary_metrics.csv
+    ├── per_time_metrics.csv
+    ├── hydrodynamics_final_time_difference.csv
+    ├── sediment_final_time_difference.csv
+    ├── bed_final_time_difference.csv
+    └── metadata.json
+```
+
+三个 `pinn_*.csv` 均有 `1633 x 433 = 707089` 行，每行对应一个
+`time_id + cell_id`。CSV 适合直接检查和制图，压缩 NPZ 适合 Python 批量读取。
+
+- `summary_metrics.csv`：整个时空域内每个字段的汇总误差。
+- `per_time_metrics.csv`：每个输出时刻、每个字段的误差。
+- `*_final_time_difference.csv`：最后一个时刻的真值、PINN 值和两者差值。
+- `metadata.json`：checkpoint、配置、坐标变换和各字段计算来源。
+
 ## 17. 诊断信息
 
 `history_<timestamp>.json` 和损失图记录：
@@ -743,7 +839,9 @@ bed_t_0001d_00h_0000086400s.npz
 - 初始级配在空间上均匀。
 - 活动层为单层近似，没有第二床层或多床层交换。
 - 孔隙率和 Manning 糙率不随级配或床面变化。
-- 未使用 HEC-RAS 或实测结果场做监督、校准和验证。
+- HEC-RAS 结果仅用于训练后的独立验证，尚未进入训练监督或参数校准。
+- 独立推理中的中间时刻级配采用初始均匀级配到 checkpoint 最终活动层级配的
+  线性过渡，因为训练结果尚未保存完整的逐时刻级配历史。
 - 床面固定点收敛不代表水动力、泥沙质量守恒误差已经达到工程标准，需要结合诊断量判断。
 
 ## 19. 代码入口
