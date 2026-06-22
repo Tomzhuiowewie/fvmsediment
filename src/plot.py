@@ -42,6 +42,7 @@ def visualize_results(
     plot_bed_evolution(bed_history, plot_context, save_path('bed'))
     plot_bed_profiles(bed_history, plot_context, save_path('profiles'))
     plot_training_history(history, plot_context, simulation_time, save_path('losses'))
+    plot_stage_loss_breakdown(history, save_path)
     plot_flow_adaptive_weights(history, save_path('flow_weights'))
 
     active_mask = plot_context.get('active_mask')
@@ -338,6 +339,155 @@ def plot_training_history(history, plot_context, simulation_time, save_path):
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'✓ {save_path}')
+
+
+def plot_stage_loss_breakdown(history, save_path):
+    """按训练阶段分别绘制各 loss 分项。"""
+    plot_phase_flow_losses(history, save_path('phase1_flow_losses'))
+    plot_phase_sediment_losses(history, save_path('phase2_sediment_losses'))
+    plot_phase_joint_losses(history, save_path('phase3_joint_losses'))
+
+
+def plot_phase_flow_losses(history, save_path):
+    groups = [
+        (
+            'Raw flow losses',
+            [
+                ('flow_loss', 'total flow', 'black', '-'),
+                ('continuity', 'continuity', 'c', '-'),
+                ('momentum_x', 'momentum x', 'r', '-'),
+                ('momentum_y', 'momentum y', 'm', '-'),
+                ('flow_boundary_loss', 'boundary raw', 'gray', '--'),
+            ],
+        ),
+        (
+            'Weighted flow losses',
+            [
+                ('weighted_continuity', 'weighted continuity', 'c', '-'),
+                ('weighted_momentum_x', 'weighted momentum x', 'r', '-'),
+                ('weighted_momentum_y', 'weighted momentum y', 'm', '-'),
+                ('weighted_flow_boundary', 'weighted boundary', 'gray', '--'),
+            ],
+        ),
+        (
+            'Flow adaptive weights',
+            [
+                ('weight_continuity', 'w continuity', 'c', '-'),
+                ('weight_momentum_x', 'w momentum x', 'r', '-'),
+                ('weight_momentum_y', 'w momentum y', 'm', '-'),
+                ('flow_boundary_weight', 'w boundary', 'gray', '--'),
+            ],
+        ),
+    ]
+    _plot_grouped_history(history, groups, 'Phase 1: Flow Training Losses', save_path)
+
+
+def plot_phase_sediment_losses(history, save_path):
+    groups = [
+        (
+            'Raw sediment losses',
+            [
+                ('sediment_loss', 'total sediment', 'black', '-'),
+                ('transport_loss', 'transport PDE', 'teal', '-'),
+                ('inlet_sediment_loss', 'inlet C', 'brown', '-'),
+                ('bed_change_loss', 'Exner bed change', 'red', '-'),
+                ('initial_sediment_loss', 'initial C', 'purple', '--'),
+                ('bed_initial_loss', 'initial dzb', 'orange', '--'),
+                ('capacity_loss', 'capacity diagnostic', 'gray', ':'),
+            ],
+        ),
+        (
+            'Weighted sediment losses',
+            [
+                ('weighted_transport_loss', 'weighted transport', 'teal', '-'),
+                ('weighted_inlet_sediment_loss', 'weighted inlet', 'brown', '-'),
+                ('weighted_bed_change_loss', 'weighted bed change', 'red', '-'),
+            ],
+        ),
+        (
+            'Sediment adaptive weights',
+            [
+                ('weight_transport', 'w transport', 'teal', '-'),
+                ('weight_inlet', 'w inlet', 'brown', '-'),
+                ('weight_bed_change', 'w bed change', 'red', '-'),
+                ('weight_capacity', 'w capacity', 'gray', ':'),
+            ],
+        ),
+    ]
+    _plot_grouped_history(history, groups, 'Phase 2: Sediment Training Losses', save_path)
+
+
+def plot_phase_joint_losses(history, save_path):
+    groups = [
+        (
+            'Joint total and blocks',
+            [
+                ('joint_loss', 'total joint', 'black', '-'),
+                ('joint_flow_loss', 'joint flow block', 'b', '-'),
+                ('joint_sediment_loss', 'joint sediment block', 'g', '-'),
+                ('joint_flow_boundary_loss', 'joint boundary raw', 'gray', '--'),
+            ],
+        ),
+        (
+            'Joint sediment components',
+            [
+                ('joint_transport_loss', 'transport PDE', 'teal', '-'),
+                ('joint_inlet_sediment_loss', 'inlet C', 'brown', '-'),
+                ('joint_bed_change_loss', 'Exner bed change', 'red', '-'),
+                ('joint_bed_initial_loss', 'initial dzb', 'orange', '--'),
+            ],
+        ),
+        (
+            'Coupling diagnostics',
+            [
+                ('coupling_bed_error', 'bed update error', 'black', '-'),
+                ('coupling_joint_loss', 'joint loss per coupling', 'b', ':'),
+            ],
+        ),
+    ]
+    _plot_grouped_history(history, groups, 'Phase 3: Joint/Coupled Training Losses', save_path)
+
+
+def _plot_grouped_history(history, groups, title, save_path):
+    if not any(history.get(key) for _, specs in groups for key, _, _, _ in specs):
+        return
+
+    fig, axes = plt.subplots(len(groups), 1, figsize=(12, 3.8 * len(groups)), squeeze=False)
+    for ax, (group_title, specs) in zip(axes[:, 0], groups):
+        has_values = False
+        for key, label, color, linestyle in specs:
+            values = _positive_history_values(history.get(key, []))
+            if values is None:
+                continue
+            ax.semilogy(values, color=color, lw=1.5, ls=linestyle, label=label)
+            has_values = True
+        ax.set_title(group_title)
+        ax.set_xlabel('Epoch / iteration')
+        ax.set_ylabel('Loss / value')
+        ax.grid(alpha=0.3)
+        if has_values:
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'✓ {save_path}')
+
+
+def _positive_history_values(values):
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return None
+    arr[~np.isfinite(arr)] = np.nan
+    arr[arr <= 0.0] = np.nan
+    if np.all(np.isnan(arr)):
+        return None
+    return arr
 
 
 def plot_flow_adaptive_weights(history, save_path):

@@ -193,6 +193,9 @@ class DecoupledTrainer:
             'inlet_sediment_loss': [],
             'bed_change_loss': [],
             'bed_initial_loss': [],
+            'weighted_transport_loss': [],
+            'weighted_inlet_sediment_loss': [],
+            'weighted_bed_change_loss': [],
             'continuity': [],
             'momentum_x': [],
             'momentum_y': [],
@@ -218,6 +221,13 @@ class DecoupledTrainer:
             'coupling_dzb_min': [],
             'coupling_dzb_max': [],
             'coupling_joint_loss': [],
+            'joint_flow_loss': [],
+            'joint_flow_boundary_loss': [],
+            'joint_sediment_loss': [],
+            'joint_transport_loss': [],
+            'joint_inlet_sediment_loss': [],
+            'joint_bed_change_loss': [],
+            'joint_bed_initial_loss': [],
             'final_projection_error': [],
             'diagnostic_time': [],
             'q_in_target': [],
@@ -457,6 +467,9 @@ class DecoupledTrainer:
                 'weight_capacity': 0.0,
                 'weight_inlet': 0.0,
                 'weight_bed_change': 0.0,
+                'weighted_transport': 0.0,
+                'weighted_inlet': 0.0,
+                'weighted_bed_change': 0.0,
                 'C_min': None,  # 记录所有 cell batch 的 C_k 最小值，检查是否有负值或数值不稳定。
                 'C_max': None,  # 记录所有 cell batch 的 C_k 最大值，检查是否有数值不稳定。
                 'dzb_min': None,    # 记录所有 cell batch 的 Δzb_k 最小值，检查是否有过度侵蚀或数值不稳定。
@@ -492,6 +505,9 @@ class DecoupledTrainer:
                         loss_acc['weight_capacity'] += sediment_dict['weight_capacity'] * weight
                         loss_acc['weight_inlet'] += sediment_dict['weight_inlet'] * weight
                         loss_acc['weight_bed_change'] += sediment_dict['weight_bed_change'] * weight
+                        loss_acc['weighted_transport'] += sediment_dict['weighted_transport'] * weight
+                        loss_acc['weighted_inlet'] += sediment_dict['weighted_inlet'] * weight
+                        loss_acc['weighted_bed_change'] += sediment_dict['weighted_bed_change'] * weight
                         loss_acc['Ceq_mean'] += sediment_dict['Ceq_mean'] * weight
                         loss_acc['C_min'] = (
                             sediment_dict['C_min']
@@ -528,6 +544,9 @@ class DecoupledTrainer:
                 self.history['inlet_sediment_loss'].append(loss_acc['inlet'])
                 self.history['bed_change_loss'].append(loss_acc['bed_change'])
                 self.history['bed_initial_loss'].append(loss_acc['bed_initial'])
+                self.history['weighted_transport_loss'].append(loss_acc['weighted_transport'])
+                self.history['weighted_inlet_sediment_loss'].append(loss_acc['weighted_inlet'])
+                self.history['weighted_bed_change_loss'].append(loss_acc['weighted_bed_change'])
                 self.history.setdefault('weight_transport', []).append(loss_acc['weight_transport'])
                 self.history.setdefault('weight_capacity', []).append(loss_acc['weight_capacity'])
                 self.history.setdefault('weight_inlet', []).append(loss_acc['weight_inlet'])
@@ -573,19 +592,30 @@ class DecoupledTrainer:
             self.sediment_model.train()
             self.joint_optimizer.zero_grad()
             total_loss_value = 0.0
+            joint_acc = {
+                'flow': 0.0,
+                'flow_boundary': 0.0,
+                'sediment': 0.0,
+                'transport': 0.0,
+                'inlet': 0.0,
+                'bed_change': 0.0,
+                'bed_initial': 0.0,
+            }
 
             for t_i in time_list:
                 # 联合 loss = 水动力方程/边界 + 泥沙方程/床变约束。
-                flow_loss, _ = self.flow_loss_fn.compute_loss(self.flow_model, t_i, self.device)
+                flow_physics_loss, _ = self.flow_loss_fn.compute_loss(self.flow_model, t_i, self.device)
                 boundary_loss = self._compute_real_flow_boundary_loss(data_coords(t_i))
-                flow_loss, _ = self._balance_flow_boundary_loss(flow_loss, boundary_loss)
+                flow_loss, _ = self._balance_flow_boundary_loss(flow_physics_loss, boundary_loss)
 
                 # 水动力 loss 已经覆盖全 active 河道；泥沙 loss 按 cell batch 分摊。
                 (flow_loss / len(time_list)).backward(retain_graph=False)
                 total_loss_value += float(flow_loss.detach().cpu()) / len(time_list)
+                joint_acc['flow'] += float(flow_loss.detach().cpu()) / len(time_list)
+                joint_acc['flow_boundary'] += float(boundary_loss.detach().cpu()) / len(time_list)
                 progress.update(loss=total_loss_value)
                 for cell_batch in cell_batches:
-                    sediment_loss, _ = self.sediment_loss_fn.compute_sediment_loss(
+                    sediment_loss, sediment_dict = self.sediment_loss_fn.compute_sediment_loss(
                         self.sediment_model,
                         self.flow_model,
                         t_i,
@@ -597,6 +627,11 @@ class DecoupledTrainer:
                     weight = 1.0 / (len(time_list) * len(cell_batches))
                     (sediment_loss * weight).backward()
                     total_loss_value += float(sediment_loss.detach().cpu()) * weight
+                    joint_acc['sediment'] += float(sediment_loss.detach().cpu()) * weight
+                    joint_acc['transport'] += sediment_dict['transport'] * weight
+                    joint_acc['inlet'] += sediment_dict['inlet'] * weight
+                    joint_acc['bed_change'] += sediment_dict['bed_change'] * weight
+                    joint_acc['bed_initial'] += sediment_dict['bed_initial'] * weight
                     progress.update(loss=total_loss_value)
 
             torch.nn.utils.clip_grad_norm_(
@@ -607,6 +642,13 @@ class DecoupledTrainer:
             if self.joint_scheduler is not None:
                 self.joint_scheduler.step(total_loss_value)
             self.history['joint_loss'].append(total_loss_value)
+            self.history['joint_flow_loss'].append(joint_acc['flow'])
+            self.history['joint_flow_boundary_loss'].append(joint_acc['flow_boundary'])
+            self.history['joint_sediment_loss'].append(joint_acc['sediment'])
+            self.history['joint_transport_loss'].append(joint_acc['transport'])
+            self.history['joint_inlet_sediment_loss'].append(joint_acc['inlet'])
+            self.history['joint_bed_change_loss'].append(joint_acc['bed_change'])
+            self.history['joint_bed_initial_loss'].append(joint_acc['bed_initial'])
             best_loss, stale_epochs, stop_reason = self._early_stop_check(
                 'joint', epoch, total_loss_value, best_loss, stale_epochs, self.joint_loss_tol
             )
