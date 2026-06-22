@@ -34,7 +34,7 @@ physics:
     epsilon_default: 0.1  # 总输沙扩散/混合系数
 
     residual_scale: 1.0
-    adaptation_length: 9.144
+    adaptation_length: 5
     rho_s: 2650.0
     rho_w: 1000.0
     kinematic_viscosity: 0.000001 # 水动力粘度 (m²/s) 对应 20°C 的淡水
@@ -53,16 +53,16 @@ physics:
     porosity: 0.4
     active_layer_thickness: 0.5
     bed_slope_coefficient: 0.05
-    bed_change_scale: 0.1 # 床面累计变化量缩放值
+    bed_change_scale: 1.0  # 床面累计变化量缩放值
     exchange_weight: 1.0
     bed_slope_diffusion_weight: 1.0
 
 training:
   flow_epochs: 200
-  sediment_epochs: 200
-  joint_epochs: 200  # 全部耦合迭代合计的联合训练 epoch
+  sediment_epochs: 100
+  joint_epochs: 100  # 全部耦合迭代合计的联合训练 epoch
   coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
-  coupling_relaxation: 0.25  # 床面和级配固定点松弛系数
+  coupling_relaxation: 1  # 床面和级配固定点松弛系数
   coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
   flow_boundary_weight: 0.01  # boundary_loss 约 8e-2，但上一轮边界误差大，给比纯拉平更强的权重
   adaptive_boundary_weighting: false  # 当前关闭动态自适应，避免边界权重被压到下限
@@ -79,6 +79,6 @@ training:
   sediment_cell_batch_size: 1024  # 泥沙分粒径自动微分显存占用大，按河道单元分批训练
   flow_lr: 0.0005
   transport_lr: 0.0005
-  w_bed_change: 1000000.0  # bed_change_loss 放大到与 transport 同量级
-  output_dir: outputs-autodl2
-  checkpoint_dir: outputs-autodl2/checkpoints
+  w_bed_change: 10000000.0  # bed_change_loss 放大到与 transport 同量级
+  output_dir: outputs
+  checkpoint_dir: outputs/checkpoints

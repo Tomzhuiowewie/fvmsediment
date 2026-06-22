@@ -40,6 +40,7 @@ def visualize_results(
     save_path = _make_save_path(case_name, output_dir, run_timestamp)
 
     plot_bed_evolution(bed_history, plot_context, save_path('bed'))
+    plot_bed_change_evolution(bed_history, plot_context, save_path('bed_change'))
     plot_bed_profiles(bed_history, plot_context, save_path('profiles'))
     plot_training_history(history, plot_context, simulation_time, save_path('losses'))
     plot_stage_loss_breakdown(history, save_path)
@@ -224,6 +225,47 @@ def plot_bed_evolution(bed_history, plot_context, save_path):
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'\n✓ {save_path}')
+
+
+def plot_bed_change_evolution(bed_history, plot_context, save_path):
+    nx = plot_context['nx']
+    ny = plot_context['ny']
+    X = plot_context['X']
+    Y = plot_context['Y']
+    time_unit = plot_context['time_unit']
+    time_scale = plot_context['time_scale']
+    output_times = plot_context['output_times']
+    time_ids = plot_context['time_ids']
+    active_mask = plot_context.get('active_mask')
+
+    z0 = _mask_bed(np.asarray(bed_history[0]).reshape(ny, nx), active_mask)
+    dz_history = [
+        _mask_bed(np.asarray(zb).reshape(ny, nx), active_mask) - z0
+        for zb in bed_history
+    ]
+    dz_abs = max(float(np.nanmax(np.abs(dz))) for dz in dz_history)
+    dz_abs = max(dz_abs, 1.0e-9)
+    levels = np.linspace(-dz_abs, dz_abs, 25)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+    for ax, tid in zip(axes.flatten(), time_ids):
+        dz = dz_history[tid]
+        t_v = output_times[tid] / time_scale
+        im = ax.contourf(X, Y, dz, levels=levels, cmap='RdBu_r', extend='both')
+        ax.contour(X, Y, dz, levels=5, colors='k', linewidths=0.3, alpha=0.5)
+        ax.set_title(
+            f't={t_v:.1f}{time_unit} '
+            f'Δzb=[{np.nanmin(dz):+.2e}, {np.nanmax(dz):+.2e}]m'
+        )
+        ax.set_aspect('equal')
+        ax.set_xlabel('x(m)')
+        ax.set_ylabel('y(m)')
+        plt.colorbar(im, ax=ax, label='Δzb(m)')
+    plt.suptitle('Bed Change Relative to Initial DEM', fontsize=13)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'✓ {save_path}')
 
 
 def plot_bed_profiles(bed_history, plot_context, save_path):
