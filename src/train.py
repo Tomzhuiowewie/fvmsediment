@@ -479,7 +479,7 @@ class DecoupledTrainer:
                         
                         total_loss_value += float(sediment_loss.detach().cpu()) * weight
                         loss_acc['transport'] += sediment_dict['transport'] * weight
-                        loss_acc['capacity'] += sediment_dict['capacity'] * weight
+                        # loss_acc['capacity'] += sediment_dict['capacity'] * weight
                         loss_acc['initial'] += sediment_dict['initial'] * weight
                         loss_acc['inlet'] += sediment_dict['inlet'] * weight
                         loss_acc['bed_change'] += sediment_dict['bed_change'] * weight
