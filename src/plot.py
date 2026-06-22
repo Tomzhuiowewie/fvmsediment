@@ -400,6 +400,7 @@ def plot_phase_sediment_losses(history, save_path):
             'Weighted sediment losses',
             [
                 ('weighted_transport_loss', 'weighted transport', 'teal', '-'),
+                ('weighted_capacity_loss', 'weighted capacity', 'orange', '--'),
                 ('weighted_inlet_sediment_loss', 'weighted inlet', 'brown', '-'),
                 ('weighted_bed_change_loss', 'weighted bed change', 'red', '-'),
             ],

@@ -680,8 +680,8 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         exner_dzb_dt_k_cell = self.exner_dzb_dt_k_cell(closure)
         bed_change_loss = torch.mean((dzb_t_k_cell - exner_dzb_dt_k_cell) ** 2)
 
-        # 容量闭合项当前不进入总损失，仅保留 C_capacity 诊断和入口平衡目标。
-        capacity_loss = torch.zeros_like(transport_loss)
+        # 弱容量闭合项：约束全场浓度不要长期偏离 Wu 输沙能力。
+        capacity_loss = torch.mean((C_tk - C_capacity.detach()) ** 2)
 
         # 初始条件只在 t=0 生效，避免把所有时刻都压到初始浓度。
         initial_loss = self.initial_condition_loss(C_tk) if abs(float(T_norm)) < 1.0e-8 else torch.zeros_like(capacity_loss)
@@ -702,12 +702,13 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
             bed_change_loss,
         ])
         weighted_transport = self.w_transport * transport_loss * float(sediment_weights[0])
+        weighted_capacity = self.w_capacity * capacity_loss
         weighted_inlet = self.w_inlet_sediment * inlet_loss * float(sediment_weights[1])
         weighted_bed_change = self.w_bed_change * bed_change_loss * float(sediment_weights[2])
 
         loss = (
             weighted_transport
-            # + weighted_capacity
+            + weighted_capacity
             + self.w_initial_sediment * initial_loss
             + weighted_inlet
             + weighted_bed_change
@@ -722,10 +723,11 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
             'bed_change': bed_change_loss.item(),
             'bed_initial': bed_initial_loss.item(),
             'weighted_transport': weighted_transport.item(),
+            'weighted_capacity': weighted_capacity.item(),
             'weighted_inlet': weighted_inlet.item(),
             'weighted_bed_change': weighted_bed_change.item(),
             'weight_transport': float(sediment_weights[0]),
-            'weight_capacity': 0.0,
+            'weight_capacity': float(self.w_capacity),
             'weight_inlet': float(sediment_weights[1]),
             'weight_bed_change': float(sediment_weights[2]),
             'residual_mean': torch.mean(torch.abs(residual)).item(),

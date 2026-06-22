@@ -26,22 +26,22 @@ class _ProgressBar:
         self.last_message_len = 0
         self._render()
 
-    def update(self, step=1, loss=None):
+    def update(self, step=1, loss=None, info=None):
         self.current = min(self.total, self.current + int(step))
-        self._render(loss=loss)
+        self._render(loss=loss, info=info)
 
-    def close(self, loss=None):
+    def close(self, loss=None, info=None):
         self.current = self.total
-        self._render(loss=loss)
+        self._render(loss=loss, info=info)
         sys.stdout.write('\n')
         sys.stdout.flush()
 
-    def finish(self, loss=None):
-        self._render(loss=loss)
+    def finish(self, loss=None, info=None):
+        self._render(loss=loss, info=info)
         sys.stdout.write('\n')
         sys.stdout.flush()
 
-    def _render(self, loss=None):
+    def _render(self, loss=None, info=None):
         ratio = self.current / self.total
         filled = int(self.width * ratio)
         bar = '#' * filled + '-' * (self.width - filled)
@@ -58,6 +58,8 @@ class _ProgressBar:
         )
         if loss is not None:
             msg += f" loss={loss:.3e}"
+        if info:
+            msg += f" {info}"
         pad = max(self.last_message_len - len(msg), 0)
         sys.stdout.write(msg + ' ' * pad)
         sys.stdout.flush()
@@ -199,6 +201,7 @@ class DecoupledTrainer:
             'bed_change_loss': [],
             'bed_initial_loss': [],
             'weighted_transport_loss': [],
+            'weighted_capacity_loss': [],
             'weighted_inlet_sediment_loss': [],
             'weighted_bed_change_loss': [],
             'continuity': [],
@@ -259,7 +262,7 @@ class DecoupledTrainer:
     # Checkpoint 与通用训练辅助
     # -------------------------------------------------------------------------
 
-    def save_checkpoint(self, name, loss=None, epoch=None, phase=None):
+    def save_checkpoint(self, name, loss=None, epoch=None, phase=None, verbose=True):
         """保存阶段 checkpoint，长训练中断后至少保留已完成阶段结果。"""
         if not self.checkpoint_dir:
             return
@@ -288,7 +291,8 @@ class DecoupledTrainer:
             'checkpoint_phase': phase,
         }
         torch.save(payload, path)
-        print(f"  checkpoint saved: {path}")
+        if verbose:
+            print(f"  checkpoint saved: {path}")
 
     def _save_best_checkpoint(self, name, phase, epoch, loss_value, best_loss):
         """如果当前 loss 刷新阶段最优，则保存 best checkpoint 并返回新的 best_loss。"""
@@ -300,6 +304,7 @@ class DecoupledTrainer:
                 loss=float(loss_value),
                 epoch=int(epoch),
                 phase=phase,
+                verbose=False,
             )
             return float(loss_value)
         return previous_best
@@ -512,6 +517,7 @@ class DecoupledTrainer:
                 'weight_inlet': 0.0,
                 'weight_bed_change': 0.0,
                 'weighted_transport': 0.0,
+                'weighted_capacity': 0.0,
                 'weighted_inlet': 0.0,
                 'weighted_bed_change': 0.0,
                 'C_min': None,  # 记录所有 cell batch 的 C_k 最小值，检查是否有负值或数值不稳定。
@@ -540,7 +546,7 @@ class DecoupledTrainer:
                         
                         total_loss_value += float(sediment_loss.detach().cpu()) * weight
                         loss_acc['transport'] += sediment_dict['transport'] * weight
-                        # loss_acc['capacity'] += sediment_dict['capacity'] * weight
+                        loss_acc['capacity'] += sediment_dict['capacity'] * weight
                         loss_acc['initial'] += sediment_dict['initial'] * weight
                         loss_acc['inlet'] += sediment_dict['inlet'] * weight
                         loss_acc['bed_change'] += sediment_dict['bed_change'] * weight
@@ -550,6 +556,7 @@ class DecoupledTrainer:
                         loss_acc['weight_inlet'] += sediment_dict['weight_inlet'] * weight
                         loss_acc['weight_bed_change'] += sediment_dict['weight_bed_change'] * weight
                         loss_acc['weighted_transport'] += sediment_dict['weighted_transport'] * weight
+                        loss_acc['weighted_capacity'] += sediment_dict['weighted_capacity'] * weight
                         loss_acc['weighted_inlet'] += sediment_dict['weighted_inlet'] * weight
                         loss_acc['weighted_bed_change'] += sediment_dict['weighted_bed_change'] * weight
                         loss_acc['Ceq_mean'] += sediment_dict['Ceq_mean'] * weight
@@ -573,7 +580,15 @@ class DecoupledTrainer:
                             if loss_acc['dzb_max'] is None
                             else max(loss_acc['dzb_max'], sediment_dict['dzb_max'])
                         )
-                        progress.update(loss=total_loss_value)
+                        progress.update(
+                            loss=total_loss_value,
+                            info=(
+                                f"tr={loss_acc['weighted_transport']:.2e} "
+                                f"cap={loss_acc['weighted_capacity']:.2e} "
+                                f"in={loss_acc['weighted_inlet']:.2e} "
+                                f"bed={loss_acc['weighted_bed_change']:.2e}"
+                            ),
+                        )
 
                 torch.nn.utils.clip_grad_norm_(self.sediment_model.parameters(), max_norm=1.0)
                 self.sediment_optimizer.step()
@@ -589,6 +604,7 @@ class DecoupledTrainer:
                 self.history['bed_change_loss'].append(loss_acc['bed_change'])
                 self.history['bed_initial_loss'].append(loss_acc['bed_initial'])
                 self.history['weighted_transport_loss'].append(loss_acc['weighted_transport'])
+                self.history['weighted_capacity_loss'].append(loss_acc['weighted_capacity'])
                 self.history['weighted_inlet_sediment_loss'].append(loss_acc['weighted_inlet'])
                 self.history['weighted_bed_change_loss'].append(loss_acc['weighted_bed_change'])
                 self.history.setdefault('weight_transport', []).append(loss_acc['weight_transport'])
@@ -613,10 +629,16 @@ class DecoupledTrainer:
             if stop_reason is not None:
                 self.history['stop_reason']['sediment'] = stop_reason
                 break
+        final_info = (
+            f"tr={loss_acc['weighted_transport']:.2e} "
+            f"cap={loss_acc['weighted_capacity']:.2e} "
+            f"in={loss_acc['weighted_inlet']:.2e} "
+            f"bed={loss_acc['weighted_bed_change']:.2e}"
+        )
         if stop_reason is None:
-            progress.close(loss=total_loss_value)
+            progress.close(loss=total_loss_value, info=final_info)
         else:
-            progress.finish(loss=total_loss_value)
+            progress.finish(loss=total_loss_value, info=final_info)
             print(f"  Early stop: {stop_reason}")
         return total_loss_value
 

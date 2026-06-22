@@ -32,7 +32,6 @@ output/*
 !output/.gitkeep
 outputs/*
 outputs-autodl/*
-output-autodl*/
 !outputs/.gitkeep
 
 # Image / generated files
