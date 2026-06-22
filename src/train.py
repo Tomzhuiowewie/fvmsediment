@@ -94,6 +94,8 @@ class DecoupledTrainer:
         flow_loss_tol=0.0,
         sediment_loss_tol=0.0,
         joint_loss_tol=0.0,
+        joint_flow_weight=1.0,
+        joint_sediment_weight=1.0,
         early_stop_patience=0,
         early_stop_min_delta=0.0,
         coupling_iterations=5,
@@ -119,6 +121,8 @@ class DecoupledTrainer:
         self.flow_loss_tol = float(flow_loss_tol or 0.0)
         self.sediment_loss_tol = float(sediment_loss_tol or 0.0)
         self.joint_loss_tol = float(joint_loss_tol or 0.0)
+        self.joint_flow_weight = max(float(joint_flow_weight), 0.0)
+        self.joint_sediment_weight = max(float(joint_sediment_weight), 0.0)
         self.early_stop_patience = int(early_stop_patience or 0)
         self.early_stop_min_delta = float(early_stop_min_delta or 0.0)
         self.coupling_iterations = max(int(coupling_iterations), 1)
@@ -137,6 +141,7 @@ class DecoupledTrainer:
         self._physics_loss_ema = None
         self._boundary_loss_ema = None
         self._current_boundary_weight = self.flow_boundary_weight
+        self._best_checkpoint_losses = {}
         self.run_timestamp = str(run_timestamp) if run_timestamp else None
         self.checkpoint_dir = checkpoint_dir
         # active_layer_frac 是每个网格单元的活动层分级比例 p_k。
@@ -222,8 +227,10 @@ class DecoupledTrainer:
             'coupling_dzb_max': [],
             'coupling_joint_loss': [],
             'joint_flow_loss': [],
+            'weighted_joint_flow_loss': [],
             'joint_flow_boundary_loss': [],
             'joint_sediment_loss': [],
+            'weighted_joint_sediment_loss': [],
             'joint_transport_loss': [],
             'joint_inlet_sediment_loss': [],
             'joint_bed_change_loss': [],
@@ -252,7 +259,7 @@ class DecoupledTrainer:
     # Checkpoint 与通用训练辅助
     # -------------------------------------------------------------------------
 
-    def save_checkpoint(self, name):
+    def save_checkpoint(self, name, loss=None, epoch=None, phase=None):
         """保存阶段 checkpoint，长训练中断后至少保留已完成阶段结果。"""
         if not self.checkpoint_dir:
             return
@@ -276,9 +283,26 @@ class DecoupledTrainer:
             'history': self.history,
             'simulation_time': self.simulation_time,
             'run_timestamp': self.run_timestamp,
+            'checkpoint_loss': None if loss is None else float(loss),
+            'checkpoint_epoch': None if epoch is None else int(epoch),
+            'checkpoint_phase': phase,
         }
         torch.save(payload, path)
         print(f"  checkpoint saved: {path}")
+
+    def _save_best_checkpoint(self, name, phase, epoch, loss_value, best_loss):
+        """如果当前 loss 刷新阶段最优，则保存 best checkpoint 并返回新的 best_loss。"""
+        previous_best = self._best_checkpoint_losses.get(name, best_loss)
+        if previous_best is None or float(loss_value) < float(previous_best):
+            self._best_checkpoint_losses[name] = float(loss_value)
+            self.save_checkpoint(
+                name,
+                loss=float(loss_value),
+                epoch=int(epoch),
+                phase=phase,
+            )
+            return float(loss_value)
+        return previous_best
 
     def _early_stop_check(self, phase, epoch, loss_value, best_loss, stale_epochs, loss_tol):
         """检查单阶段训练是否满足提前停止条件。"""
@@ -385,6 +409,7 @@ class DecoupledTrainer:
         
         total_loss_value = 0.0
         best_loss = None
+        best_checkpoint_loss = None
         stale_epochs = 0    # 连续若干 epoch loss 没有改善的计数器
         stop_reason = None
 
@@ -432,6 +457,13 @@ class DecoupledTrainer:
             self.history['flow_boundary_loss'].append(boundary_loss_acc)
             self.history['flow_boundary_weight'].append(boundary_weight_acc)
             self.history['weighted_flow_boundary'].append(weighted_boundary_acc)
+            best_checkpoint_loss = self._save_best_checkpoint(
+                'best_phase1_flow',
+                'flow',
+                epoch,
+                total_loss_value,
+                best_checkpoint_loss,
+            )
             best_loss, stale_epochs, stop_reason = self._early_stop_check(
                 'flow', epoch, total_loss_value, best_loss, stale_epochs, self.flow_loss_tol
             )
@@ -462,6 +494,7 @@ class DecoupledTrainer:
         total_loss_value = 0.0
         progress = _ProgressBar('Sediment PINN', n_epochs * len(time_list) * len(cell_batches))
         best_loss = None
+        best_checkpoint_loss = None
         stale_epochs = 0 # 连续若干 epoch loss 没有改善的计数器
         stop_reason = None
 
@@ -567,6 +600,13 @@ class DecoupledTrainer:
                 self.history['dzb_min'].append(loss_acc['dzb_min'])
                 self.history['dzb_max'].append(loss_acc['dzb_max'])
                 self.history['Ceq_mean'].append(loss_acc['Ceq_mean'])
+            best_checkpoint_loss = self._save_best_checkpoint(
+                'best_phase2_sediment',
+                'sediment',
+                epoch,
+                total_loss_value,
+                best_checkpoint_loss,
+            )
             best_loss, stale_epochs, stop_reason = self._early_stop_check(
                 'sediment', epoch, total_loss_value, best_loss, stale_epochs, self.sediment_loss_tol
             )
@@ -596,6 +636,7 @@ class DecoupledTrainer:
         total_loss_value = 0.0
         progress = _ProgressBar('Joint PINN', max(n_epochs, 0) * len(time_list) * (1 + len(cell_batches)))
         best_loss = None
+        best_checkpoint_loss = None
         stale_epochs = 0
         stop_reason = None
 
@@ -621,8 +662,9 @@ class DecoupledTrainer:
                 flow_loss, _ = self._balance_flow_boundary_loss(flow_physics_loss, boundary_loss)
 
                 # 水动力 loss 已经覆盖全 active 河道；泥沙 loss 按 cell batch 分摊。
-                (flow_loss / len(time_list)).backward(retain_graph=False)
-                total_loss_value += float(flow_loss.detach().cpu()) / len(time_list)
+                weighted_flow_loss = self.joint_flow_weight * flow_loss
+                (weighted_flow_loss / len(time_list)).backward(retain_graph=False)
+                total_loss_value += float(weighted_flow_loss.detach().cpu()) / len(time_list)
                 joint_acc['flow'] += float(flow_loss.detach().cpu()) / len(time_list)
                 joint_acc['flow_boundary'] += float(boundary_loss.detach().cpu()) / len(time_list)
                 progress.update(loss=total_loss_value)
@@ -637,8 +679,9 @@ class DecoupledTrainer:
                         cell_indices=cell_batch,
                     )
                     weight = 1.0 / (len(time_list) * len(cell_batches))
-                    (sediment_loss * weight).backward()
-                    total_loss_value += float(sediment_loss.detach().cpu()) * weight
+                    weighted_sediment_loss = self.joint_sediment_weight * sediment_loss
+                    (weighted_sediment_loss * weight).backward()
+                    total_loss_value += float(weighted_sediment_loss.detach().cpu()) * weight
                     joint_acc['sediment'] += float(sediment_loss.detach().cpu()) * weight
                     joint_acc['transport'] += sediment_dict['transport'] * weight
                     joint_acc['inlet'] += sediment_dict['inlet'] * weight
@@ -655,12 +698,25 @@ class DecoupledTrainer:
                 self.joint_scheduler.step(total_loss_value)
             self.history['joint_loss'].append(total_loss_value)
             self.history['joint_flow_loss'].append(joint_acc['flow'])
+            self.history['weighted_joint_flow_loss'].append(
+                self.joint_flow_weight * joint_acc['flow']
+            )
             self.history['joint_flow_boundary_loss'].append(joint_acc['flow_boundary'])
             self.history['joint_sediment_loss'].append(joint_acc['sediment'])
+            self.history['weighted_joint_sediment_loss'].append(
+                self.joint_sediment_weight * joint_acc['sediment']
+            )
             self.history['joint_transport_loss'].append(joint_acc['transport'])
             self.history['joint_inlet_sediment_loss'].append(joint_acc['inlet'])
             self.history['joint_bed_change_loss'].append(joint_acc['bed_change'])
             self.history['joint_bed_initial_loss'].append(joint_acc['bed_initial'])
+            best_checkpoint_loss = self._save_best_checkpoint(
+                'best_phase3_joint',
+                'joint',
+                epoch,
+                total_loss_value,
+                best_checkpoint_loss,
+            )
             best_loss, stale_epochs, stop_reason = self._early_stop_check(
                 'joint', epoch, total_loss_value, best_loss, stale_epochs, self.joint_loss_tol
             )
@@ -680,32 +736,12 @@ class DecoupledTrainer:
     # -------------------------------------------------------------------------
 
     def _balance_flow_boundary_loss(self, physics_loss, boundary_loss):
-        """使边界损失的加权贡献与水动力 PDE 总损失保持同量级。"""
+        """使用固定边界权重叠加水动力 PDE 和真实边界损失。"""
         physics_value = max(float(physics_loss.detach().cpu()), 1.0e-12)
         boundary_value = max(float(boundary_loss.detach().cpu()), 1.0e-12)
-        if self._physics_loss_ema is None:
-            self._physics_loss_ema = physics_value
-            self._boundary_loss_ema = boundary_value
-        else:
-            decay = self.boundary_weight_ema_decay
-            self._physics_loss_ema = (
-                decay * self._physics_loss_ema
-                + (1.0 - decay) * physics_value
-            )
-            self._boundary_loss_ema = (
-                decay * self._boundary_loss_ema
-                + (1.0 - decay) * boundary_value
-            )
-
-        if self.adaptive_boundary_weighting:
-            weight = self._physics_loss_ema / max(self._boundary_loss_ema, 1.0e-12)
-            weight = float(np.clip(
-                weight,
-                self.boundary_weight_min,
-                self.boundary_weight_max,
-            ))
-        else:
-            weight = self.flow_boundary_weight
+        self._physics_loss_ema = physics_value
+        self._boundary_loss_ema = boundary_value
+        weight = self.flow_boundary_weight
         self._current_boundary_weight = weight
         return physics_loss + weight * boundary_loss, weight
 

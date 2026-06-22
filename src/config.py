@@ -25,6 +25,9 @@ class FlowConfig:
     adaptive_weight_ema_decay: float
     adaptive_weight_min: float
     adaptive_weight_max: float
+    w_continuity: float
+    w_momentum_x: float
+    w_momentum_y: float
 
 
 @dataclass
@@ -41,7 +44,9 @@ class SedimentConfig:
     skin_shear_factor: float
     alpha_active_layer: float
     w_capacity: float
+    w_transport: float
     w_initial_sediment: float
+    w_bed_initial: float
     initial_concentration: List[float]
     w_inlet_sediment: float
     source_sharpness: float
@@ -145,6 +150,12 @@ class SimulationConfig:
     def flow_weight_min(self): return self.flow.adaptive_weight_min
     @property
     def flow_weight_max(self): return self.flow.adaptive_weight_max
+    @property
+    def w_continuity(self): return self.flow.w_continuity
+    @property
+    def w_momentum_x(self): return self.flow.w_momentum_x
+    @property
+    def w_momentum_y(self): return self.flow.w_momentum_y
 
     @property
     def grain_diameters(self): return self.sediment.grain_diameters
@@ -171,7 +182,11 @@ class SimulationConfig:
     @property
     def w_capacity(self): return self.sediment.w_capacity
     @property
+    def w_transport(self): return self.sediment.w_transport
+    @property
     def w_initial_sediment(self): return self.sediment.w_initial_sediment
+    @property
+    def w_bed_initial(self): return self.sediment.w_bed_initial
     @property
     def initial_sediment_concentration(self): return self.sediment.initial_concentration
     @property
@@ -231,6 +246,9 @@ def load_config(path) -> SimulationConfig:
             adaptive_weight_ema_decay=float(flow_raw.get('adaptive_weight_ema_decay', 0.95)),
             adaptive_weight_min=float(flow_raw.get('adaptive_weight_min', 0.05)),
             adaptive_weight_max=float(flow_raw.get('adaptive_weight_max', 20.0)),
+            w_continuity=float(flow_raw.get('w_continuity', 1.0)),
+            w_momentum_x=float(flow_raw.get('w_momentum_x', 1.0)),
+            w_momentum_y=float(flow_raw.get('w_momentum_y', 1.0)),
         ),
         sediment=SedimentConfig(
             grain_diameters=grain_diameters,
@@ -245,7 +263,9 @@ def load_config(path) -> SimulationConfig:
             skin_shear_factor=float(sediment_raw.get('skin_shear_factor', 1.0)),
             alpha_active_layer=float(sediment_raw.get('alpha_active_layer', 10.0)),
             w_capacity=float(sediment_raw.get('w_capacity', 0.05)),
+            w_transport=float(sediment_raw.get('w_transport', 1.0)),
             w_initial_sediment=float(sediment_raw.get('w_initial_sediment', 1.0)),
+            w_bed_initial=float(sediment_raw.get('w_bed_initial', 1.0)),
             initial_concentration=initial_concentration,
             w_inlet_sediment=float(sediment_raw.get('w_inlet_sediment', 1.0)),
             source_sharpness=float(sediment_raw.get('source_sharpness', EPS_VELOCITY_CLAMP)),

@@ -75,6 +75,7 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
                  simulation_time=1.0, include_time_terms=True,
                  adaptive_weighting=True, adaptive_weight_ema_decay=0.95,
                  adaptive_weight_min=0.05, adaptive_weight_max=20.0,
+                 w_continuity=1.0, w_momentum_x=1.0, w_momentum_y=1.0,
                  eps=EPS_SAFE):
         self.mesh = fvm_mesh
         self.g = g
@@ -95,7 +96,10 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         )
         self._flow_loss_ema = None
         self._flow_loss_ref = None
-        self._flow_loss_weights = np.ones(3, dtype=np.float64)
+        self._flow_loss_weights = np.asarray(
+            [w_continuity, w_momentum_x, w_momentum_y],
+            dtype=np.float64,
+        )
         self.eps = eps
         cell_area = fvm_mesh.cell_area
         cell_perimeter = 4.0 * fvm_mesh.resolution
@@ -118,39 +122,22 @@ class SVEsPhysicsLoss(_CachedMeshTensors):
         self._init_cache(fvm_mesh)
 
     def _adaptive_weights(self, losses):
-        """根据各 PDE 分量的相对下降进度生成均值为 1 的 detached 权重。
+        """返回水动力 PDE 分项固定权重。
 
-        这里不再按 loss 绝对量级取反。对浅水方程而言，动量残差通常比连续
-        残差大很多，直接反比加权会把主流方向动量项压得太弱。当前策略参考
-        ReLoBRaLo/相对进度平衡的思想：相对初始基准下降慢的项获得更高权重。
+        各残差在 compute_loss 前已经按典型水深、流速、单元面积和模拟时间做
+        量级缩放；这里不再根据训练过程动态改变权重，避免边界或动量项被自动
+        压低。保留 adaptive_weighting 参数仅为兼容旧配置。
         """
         values = np.asarray(
             [float(loss.detach().cpu()) for loss in losses],
             dtype=np.float64,
         )
-        values = np.maximum(values, EPS_DIVISION)
-        if self._flow_loss_ema is None:
-            self._flow_loss_ema = values
+        self._flow_loss_ema = values
+        if self._flow_loss_ref is None:
             self._flow_loss_ref = values.copy()
-        else:
-            decay = self.adaptive_weight_ema_decay
-            self._flow_loss_ema = decay * self._flow_loss_ema + (1.0 - decay) * values
-
-        if not self.adaptive_weighting:
+        if self._flow_loss_weights.shape[0] != values.shape[0]:
             self._flow_loss_weights = np.ones_like(values)
-            return self._flow_loss_weights
-
-        progress = self._flow_loss_ema / np.maximum(self._flow_loss_ref, EPS_DIVISION)
-        weights = progress / np.mean(progress)
-        weights = np.clip(
-            weights,
-            self.adaptive_weight_min,
-            self.adaptive_weight_max,
-        )
-        # 截断后再次归一化，保持三个 PDE 分量的平均权重为 1。
-        weights = weights / np.mean(weights)
-        self._flow_loss_weights = weights
-        return weights
+        return self._flow_loss_weights
 
     def compute_loss(self, model, t, device):
         """计算 SVEs 物理损失。
@@ -315,10 +302,12 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         include_time_terms=True,
         alpha_active_layer=10.0,
         w_capacity=0.05,
+        w_transport=1.0,
         w_initial_sediment=1.0,
         initial_sediment_concentration=None,
         w_inlet_sediment=1.0,
         w_bed_change=1.0,
+        w_bed_initial=1.0,
         porosity=0.4,
         bed_slope_coefficient=0.2,
         bed_slope_diffusion_weight=1.0,
@@ -345,10 +334,12 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         self.include_time_terms = include_time_terms
         self.alpha_active_layer = alpha_active_layer
         self.w_capacity = w_capacity
+        self.w_transport = w_transport
         self.w_initial_sediment = w_initial_sediment
         self.initial_sediment_concentration = initial_sediment_concentration
         self.w_inlet_sediment = w_inlet_sediment
         self.w_bed_change = w_bed_change
+        self.w_bed_initial = w_bed_initial
         self.porosity = porosity
         self.bed_slope_coefficient = bed_slope_coefficient
         self.bed_slope_diffusion_weight = bed_slope_diffusion_weight
@@ -381,29 +372,21 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         return self._grain_diameters_cache[key]
 
     def _sediment_adaptive_weights(self, losses):
-        """对持续存在的泥沙 loss 项做相对下降进度平衡。
+        """返回泥沙分项固定权重。
 
-        只平衡 transport/inlet/bed_change。初始条件项只在 t=0 生效，
-        继续使用固定权重，避免把单一时刻约束混入全时域动态权重。
+        输沙残差、入口浓度和床变约束已分别做物理量级缩放；这里不再做动态
+        自适应权重，最终权重只由 w_inlet_sediment、w_bed_change 等显式配置
+        控制。
         """
         values = np.asarray(
             [float(loss.detach().cpu()) for loss in losses],
             dtype=np.float64,
         )
-        values = np.maximum(values, EPS_DIVISION)
-        if self._sediment_loss_ema is None:
-            self._sediment_loss_ema = values
+        self._sediment_loss_ema = values
+        if self._sediment_loss_ref is None:
             self._sediment_loss_ref = values.copy()
-        else:
-            decay = 0.95
-            self._sediment_loss_ema = decay * self._sediment_loss_ema + (1.0 - decay) * values
-
-        progress = self._sediment_loss_ema / np.maximum(self._sediment_loss_ref, EPS_DIVISION)
-        weights = progress / np.mean(progress)
-        weights = np.clip(weights, 0.2, 20.0)
-        weights = weights / np.mean(weights)
-        self._sediment_loss_weights = weights
-        return weights
+        self._sediment_loss_weights = np.ones_like(values)
+        return self._sediment_loss_weights
 
     def _physical_grad(self, q, xyt, dim):
         """Return physical-space derivative for x(dim=0) or y(dim=1)."""
@@ -520,11 +503,13 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         # 级配
         if p_k_override is not None:
             p_source = p_k_override
-            if torch.is_tensor(p_source) and p_source.shape[0] == self.mesh.n_gauss_total:
+            if not torch.is_tensor(p_source):
+                p_source = torch.as_tensor(p_source, dtype=C_tk.dtype, device=C_tk.device)
+            if p_source.shape[0] == self.mesh.n_gauss_total:
                 p_source = p_source[gauss_ids_t]
             p_k = p_source.to(dtype=C_tk.dtype, device=C_tk.device)
         else:
-            print("Warning: Using model-predicted p_k for closure. Consider providing p_k_override for stability.")
+            p_k = torch.full_like(C_tk, 1.0 / max(n_grains, 1))
 
         # 闭合关系计算
         beta_tk = torch.ones_like(C_tk) * self.beta_default # 输沙修正系数
@@ -716,7 +701,7 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
             inlet_loss,
             bed_change_loss,
         ])
-        weighted_transport = transport_loss * float(sediment_weights[0])
+        weighted_transport = self.w_transport * transport_loss * float(sediment_weights[0])
         weighted_inlet = self.w_inlet_sediment * inlet_loss * float(sediment_weights[1])
         weighted_bed_change = self.w_bed_change * bed_change_loss * float(sediment_weights[2])
 
@@ -726,7 +711,7 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
             + self.w_initial_sediment * initial_loss
             + weighted_inlet
             + weighted_bed_change
-            + self.w_bed_change * bed_initial_loss
+            + self.w_bed_initial * bed_initial_loss
         )
         
         return loss, {

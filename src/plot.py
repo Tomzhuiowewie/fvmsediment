@@ -425,6 +425,8 @@ def plot_phase_joint_losses(history, save_path):
                 ('joint_loss', 'total joint', 'black', '-'),
                 ('joint_flow_loss', 'joint flow block', 'b', '-'),
                 ('joint_sediment_loss', 'joint sediment block', 'g', '-'),
+                ('weighted_joint_flow_loss', 'weighted flow block', 'navy', '--'),
+                ('weighted_joint_sediment_loss', 'weighted sediment block', 'darkgreen', '--'),
                 ('joint_flow_boundary_loss', 'joint boundary raw', 'gray', '--'),
             ],
         ),

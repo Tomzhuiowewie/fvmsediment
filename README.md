@@ -721,8 +721,13 @@ YYYYMMDD-HHMMSS
 outputs/checkpoints/
 ├── phase1_flow_<timestamp>.pt
 ├── phase2_sediment_<timestamp>.pt
-└── phase3_joint_<timestamp>.pt
+├── phase3_joint_<timestamp>.pt
+├── best_phase1_flow_<timestamp>.pt
+├── best_phase2_sediment_<timestamp>.pt
+└── best_phase3_joint_<timestamp>.pt
 ```
+
+`phase*` 文件保存阶段结束时的最后模型；`best_phase*` 文件保存该阶段 loss 最低的模型。
 
 checkpoint 包含：
 
@@ -731,7 +736,8 @@ checkpoint 包含：
 - 当前活动层级配；
 - 当前绝对床面；
 - 训练历史；
-- 模拟时间与运行时间戳。
+- 模拟时间与运行时间戳；
+- 对 best checkpoint，还包含 `checkpoint_loss`、`checkpoint_epoch` 和 `checkpoint_phase`。
 
 ### 16.2 最终结果
 
