@@ -296,6 +296,15 @@ class DecoupledTrainer:
             )
         return best_loss, stale_epochs, None
 
+    def _required_epoch_count(self, name, value):
+        """把配置里的 epoch 数转成非负整数；缺失时给出明确错误。"""
+        if value is None:
+            raise ValueError(f"training.{name} 不能为空，请在 config.yaml 中设置整数。")
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"training.{name} 必须是整数，当前值为 {value!r}。") from exc
+
     def _init_gradation(self, initial_gradation):
         """用 Excel 级配初始化活动层；如果未提供，则退化为均匀级配。"""
         n_grains = len(self.sediment_loss_fn.grain_diameters)
@@ -369,6 +378,7 @@ class DecoupledTrainer:
         T_norm 可以是多个归一化时间点；每个 epoch 会在这些时间点上分别计算
         浅水方程残差和真实边界 loss，再取平均。
         """
+        n_epochs = self._required_epoch_count('flow_epochs', n_epochs)
         self.flow_model.train()
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         progress = _ProgressBar('Flow PINN', n_epochs * len(time_list))
@@ -441,6 +451,7 @@ class DecoupledTrainer:
         freeze_flow_params=True 时，水动力场只作为已训练好的背景场提供 h/u/v，
         梯度不会更新 flow_model；泥沙网络学习分粒径浓度 C_k 和分粒径累计床变 Δzb_k。
         """
+        n_epochs = self._required_epoch_count('sediment_epochs', n_epochs)
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         self.flow_model.eval()
         # 当前活动层级配会影响输沙能力闭合，因此每个训练阶段开始时映射到高斯点。
@@ -575,6 +586,7 @@ class DecoupledTrainer:
         联合阶段不再冻结 flow_model，因此泥沙 loss 中的梯度也可以反馈到 h/u/v。
         这一步用于修正“先水后沙”分阶段训练造成的弱耦合误差。
         """
+        n_epochs = self._required_epoch_count('joint_epochs', n_epochs)
         if n_epochs <= 0 or self.sediment_model is None or self.joint_optimizer is None:
             return 0.0
 

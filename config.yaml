@@ -53,9 +53,9 @@ physics:
     bed_slope_diffusion_weight: 1.0
 
 training:
-  flow_epochs: 500
-  sediment_epochs: 500
-  joint_epochs: 300  # 全部耦合迭代合计的联合训练 epoch
+  flow_epochs: 1
+  sediment_epochs: 1
+  joint_epochs: 1  # 全部耦合迭代合计的联合训练 epoch
   coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
   coupling_relaxation: 0.25  # 床面和级配固定点松弛系数
   coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
