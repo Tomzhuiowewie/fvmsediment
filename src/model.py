@@ -1,7 +1,7 @@
 # model.py – PINN 网络模型定义
 # 包含：残差块、基类 PINN、以及两个物理子网络
 #   FlowPINN      → 水深 h、流速 u, v
-#   SedimentPINN  → 总输沙浓度 C_tk 和累计床变 Δzb
+#   SedimentPINN  → 总输沙浓度 C_tk 和分粒径累计床变 Δzb_k
 
 import torch
 import torch.nn as nn
@@ -82,7 +82,7 @@ class FlowPINN(BasePINN):
         typical_h: float, typical_u: float,
     ) -> torch.Tensor:
         h_norm = h / typical_h
-        u_norm = u / typical_u
+        u_norm = u / (2.0 * typical_u) + 0.5
         v_norm = v / (2.0 * typical_u) + 0.5
         return torch.cat([h_norm, u_norm, v_norm], dim=1)
 
@@ -91,14 +91,14 @@ class FlowPINN(BasePINN):
         raw: torch.Tensor, typical_h: float, typical_u: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = raw[:, 0:1] * typical_h
-        u = raw[:, 1:2] * typical_u
+        u = (raw[:, 1:2] - 0.5) * 2.0 * typical_u
         v = (raw[:, 2:3] - 0.5) * 2.0 * typical_u
         return h, u, v
 
 
 class SedimentPINN(BasePINN):
     """
-    总输沙输移 PINN：输入 (x, y, t)，输出各粒径级总输沙浓度 C_tk 和累计床变 Δzb。
+    总输沙输移 PINN：输入 (x, y, t)，输出各粒径级总输沙浓度 C_tk 和分粒径累计床变 Δzb_k。
     """
 
     def __init__(self, input_dim=3, hidden_dim=64, num_block=4,

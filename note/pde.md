@@ -9,7 +9,7 @@
   - `SedimentPINN(x,y,t) -> C_tk`：输出每个粒径组的总输沙浓度。
 - `src/physics.py`
   - `SVEsPhysicsLoss`：二维浅水方程有限体积残差。
-  - `SedimentTransportLoss`：总输沙方程有限体积残差。
+  - `SedimentPhysicsLoss`：总输沙方程有限体积残差。
   - `ClosureFormulation`：沉速公式和 Wu 总输沙潜力公式。
   - `MorphodynamicsUpdater`：Exner 床变和活动层/第二层级配显式更新。
 - `src/train.py`
@@ -127,7 +127,7 @@ $$
 
 代码位置：
 
-- `src/physics.py`：`SedimentTransportLoss.total_load_fvm_loss()`
+- `src/physics.py`：`SedimentPhysicsLoss.total_load_fvm_loss()`
 
 ## 5. Wu 总输沙潜力闭合
 
@@ -136,10 +136,10 @@ $$
 速度模长：
 
 $$
-U=\sqrt{u^2+v^2+\epsilon}
+U=\sqrt{u^2+v^2}
 $$
 
-床面剪应力：
+总床面剪应力：
 
 $$
 \tau_b
@@ -147,7 +147,7 @@ $$
 \rho_w g n^2 \frac{U^2}{h^{1/3}}
 $$
 
-skin shear：
+有效床面剪应力：
 
 $$
 \tau'_b = f_{skin}\tau_b
@@ -265,7 +265,7 @@ $$
 
 代码位置：
 
-- `src/physics.py`：`SedimentTransportLoss.compute_closure()`
+- `src/physics.py`：`SedimentPhysicsLoss.compute_closure()`
 
 ## 8. Exner 床变方程
 

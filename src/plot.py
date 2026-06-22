@@ -1,7 +1,8 @@
-# evaluate.py - 训练结果可视化
-# 输出三类图：床面等值图、中心剖面、训练损失历史。
+# plot.py - 训练结果可视化
+# 输出床面等值图、中心剖面、训练损失历史和自适应权重曲线。
 
 import os
+from io import BytesIO
 
 import numpy as np
 
@@ -99,6 +100,91 @@ def _mask_bed(zb_2d, active_mask):
     if active_mask is None:
         return zb_2d
     return np.where(active_mask, zb_2d, np.nan)
+
+
+def plot_dem_overview(
+    bed_grid,
+    active_mask,
+    bbox=None,
+    save_path=None,
+    title='Initial DEM and Active Mask',
+):
+    """绘制初始 DEM、河道有效单元 mask 和 active 区床面。
+
+    bbox 可以传真实坐标范围 dict，也可以直接传 resolution 标量。
+    不传 save_path 时适合在 notebook 中直接显示。
+    """
+    if not HAS_MATPLOTLIB:
+        print("未安装 matplotlib，跳过 DEM 绘图。")
+        return
+
+    bed = np.asarray(bed_grid, dtype=np.float64)
+    active = np.asarray(active_mask, dtype=bool)
+    if bed.shape != active.shape:
+        raise ValueError("bed_grid 和 active_mask 形状必须一致。")
+
+    if save_path:
+        output_dir = os.path.dirname(save_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+    extent = _dem_extent(bed.shape, bbox)
+    active_bed = _mask_bed(bed, active)
+    active_count = int(np.count_nonzero(active))
+    total_count = int(active.size)
+    active_ratio = active_count / max(total_count, 1)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    im0 = axes[0].imshow(bed, origin='lower', extent=extent, cmap='terrain')
+    axes[0].set_title('DEM bed elevation')
+    axes[0].set_xlabel('x(m)')
+    axes[0].set_ylabel('y(m)')
+    plt.colorbar(im0, ax=axes[0], label='zb(m)')
+
+    im1 = axes[1].imshow(active.astype(float), origin='lower', extent=extent, cmap='gray_r', vmin=0, vmax=1)
+    axes[1].set_title(f'Active mask: {active_count}/{total_count} ({active_ratio:.1%})')
+    axes[1].set_xlabel('x(m)')
+    axes[1].set_ylabel('y(m)')
+    plt.colorbar(im1, ax=axes[1], label='active')
+
+    im2 = axes[2].imshow(active_bed, origin='lower', extent=extent, cmap='terrain')
+    axes[2].set_title('DEM inside active mask')
+    axes[2].set_xlabel('x(m)')
+    axes[2].set_ylabel('y(m)')
+    plt.colorbar(im2, ax=axes[2], label='zb(m)')
+
+    for ax in axes:
+        ax.set_aspect('equal')
+        ax.grid(alpha=0.15)
+
+    plt.suptitle(title)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        print(f'✓ {save_path}')
+        return None
+
+    try:
+        from IPython.display import Image, display
+        buffer = BytesIO()
+        fig.savefig(buffer, format='png', dpi=150, bbox_inches='tight')
+        display(Image(data=buffer.getvalue()))
+        plt.close(fig)
+    except ImportError:
+        plt.show()
+    return fig
+
+
+def _dem_extent(shape, bbox):
+    ny, nx = shape
+    if bbox is None:
+        return [0.0, float(nx), 0.0, float(ny)]
+    if isinstance(bbox, dict):
+        return [bbox['xmin'], bbox['xmax'], bbox['ymin'], bbox['ymax']]
+    resolution = float(bbox)
+    return [0.0, float(nx) * resolution, 0.0, float(ny) * resolution]
 
 
 def plot_bed_evolution(bed_history, plot_context, save_path):

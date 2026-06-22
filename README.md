@@ -55,8 +55,8 @@ GeoTIFF DEM + Excel 流量/水位过程线 + Excel 床沙级配
 │   ├── model.py         # FlowPINN 和 SedimentPINN
 │   ├── physics.py       # SWE、输沙、Wu 和 Exner 物理关系
 │   ├── train.py         # 三阶段训练与全时域耦合
-│   ├── evaluate.py      # 床面和损失可视化
-│   └── utils.py         # 坐标归一化与自动微分工具
+│   ├── plot.py          # 床面、损失和 DEM/mask 可视化
+│   └── utils.py         # 数值工具、输出保存和配置摘要
 └── outputs/             # checkpoint、模型、结果和 PNG
 ```
 
@@ -180,15 +180,17 @@ v = (r_v-0.5)2U_{typ}
 ### 5.2 SedimentPINN
 
 ```text
-SedimentPINN(x,y,t) -> C_1,...,C_K,Δzb
+SedimentPINN(x,y,t) -> C_1,...,C_K,Δzb_1,...,Δzb_K
 ```
 
 - 前 `K` 个输出为分粒径总输沙浓度。
 - 浓度经过 Softplus，保证非负。
-- 最后一个输出为网络累计床变 `Δzb`。
+- 后 `K` 个输出为分粒径累计床变 `Δzb_k`。
 - 原始床变输出乘 `bed_change_scale`。
 
-网络 `Δzb` 用于 Exner 时间导数约束和诊断。正式床面历史由 Exner 床变率的全时域积分生成。
+网络 `Δzb_k` 的时间导数用分粒径 Exner 方程约束。联合阶段更新 DEM 时，
+直接取泥沙 PINN 在目标时刻预测的 `Δzb_k`，求和得到总床变，同时用
+`Δzb_k` 更新活动层级配。
 
 ## 6. 水动力方程
 
@@ -669,8 +671,8 @@ python scripts/export_pinn_inference.py \
 - `h、u、v`：FlowPINN 在每个 HEC-RAS 单元中心和时刻直接计算。
 - 分组浓度：SedimentPINN 在相同坐标和时刻直接计算，再由体积浓度乘
   `rho_s` 转为 `kg/m3`。
-- `bed_change_m`：直接取 SedimentPINN 的最后一个输出，即该位置、该时刻
-  相对初始床面的累计床变。
+- `bed_change_m`：直接取 SedimentPINN 后 `K` 个 `Δzb_k` 输出并求和，即该位置、
+  该时刻相对初始床面的累计床变。
 - `bed_elevation_m`：初始 DEM 双线性插值值加 `bed_change_m`。
 - 输沙能力和床面剪应力：使用 PINN 的 `h、u、v` 重新调用 Wu 闭合计算。
 

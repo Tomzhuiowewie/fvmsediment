@@ -13,6 +13,10 @@ CFS_TO_CMS = 0.028316846592
 MM_TO_M = 1.0e-3
 
 
+# =============================================================================
+# 数据容器
+# =============================================================================
+
 @dataclass
 class RealCaseData:
     """真实算例输入数据容器。
@@ -32,6 +36,10 @@ class RealCaseData:
     grain_diameters: list[float]
     grain_fractions: list[float]
 
+
+# =============================================================================
+# FVM 规则网格与 DEM 床面
+# =============================================================================
 
 class FVMeshPreprocessor:
     def __init__(self, bbox, resolution, initial_bed=None, n_gauss_points=2, active_mask=None):
@@ -112,6 +120,7 @@ class FVMeshPreprocessor:
             self.active_cell_mask_2d = self.active_cell_mask.reshape(self.ny, self.nx)
         else:
             raise ValueError("active_mask 形状必须与 FVM 网格一致。")
+        self.active_cell_ids = np.where(self.active_cell_mask)[0].astype(np.int64)
 
     def _setup_gauss_quadrature(self):
         if self.n_gauss_points == 2:
@@ -165,6 +174,10 @@ class FVMeshPreprocessor:
                     self.gauss_edge_id[idx] = edge_id
                     self.gauss_neighbor_id[idx] = neighbor_cell
                     idx += 1
+        self.active_gauss_ids = (
+            self.active_cell_ids[:, None] * self.n_points_per_cell
+            + np.arange(self.n_points_per_cell, dtype=np.int64)[None, :]
+        ).reshape(-1)
 
     def update_bed(self, new_zb):
         """更新当前绝对床面高程，保留初始床面用于累计变化诊断。"""
@@ -174,9 +187,14 @@ class FVMeshPreprocessor:
         if not np.all(np.isfinite(bed)):
             raise ValueError("new_zb 包含 NaN 或 Inf。")
         self.zb = bed
+        self._bed_gradient_cache = {}
 
-    def get_bed_gradient(self,device):
+    def get_bed_gradient(self, device):
         """用中心差分计算床面坡度 ∂zb/∂x 和 ∂zb/∂y。"""
+        cache = getattr(self, '_bed_gradient_cache', {})
+        if device in cache:
+            return cache[device]
+
         zb_2d = self.zb.reshape(self.ny, self.nx)
         dzb_dx = np.zeros_like(zb_2d)
         dzb_dy = np.zeros_like(zb_2d)
@@ -193,17 +211,99 @@ class FVMeshPreprocessor:
             dzb_dy[0, :] = (zb_2d[1, :] - zb_2d[0, :]) / self.resolution
             dzb_dy[-1, :] = (zb_2d[-1, :] - zb_2d[-2, :]) / self.resolution
 
-        return (
+        tensors = (
             torch.tensor(dzb_dx.flatten(), dtype=torch.float32, device=device),
             torch.tensor(dzb_dy.flatten(), dtype=torch.float32, device=device),
         )
+        self._bed_gradient_cache = cache
+        self._bed_gradient_cache[device] = tensors
+        return tensors
 
+
+# =============================================================================
+# 河道边界连通段筛选
+# =============================================================================
+
+def boundary_exposed_mask(active_mask_2d, edge):
+    """筛选 active 区域在指定方向上邻接 inactive/外部的暴露边单元。"""
+    mask = np.asarray(active_mask_2d, dtype=bool)
+    if edge == 'top':
+        neighbor_active = np.pad(mask[1:, :], ((0, 1), (0, 0)), constant_values=False)
+    elif edge == 'bottom':
+        neighbor_active = np.pad(mask[:-1, :], ((1, 0), (0, 0)), constant_values=False)
+    else:
+        raise ValueError("当前只支持 top/bottom 边界。")
+    return mask & (~neighbor_active)
+
+
+def select_boundary_component(active_mask_2d, edge):
+    """从暴露边中选出主入口/出口连通段。
+
+    DEM 河道可能斜向穿过边界，使用 8 邻域把斜向相邻的暴露边连起来。
+    top 选平均行号最大的连通段；bottom 选平均行号最小的连通段。
+    """
+    exposed = boundary_exposed_mask(active_mask_2d, edge)
+    selected = np.zeros_like(exposed, dtype=bool)
+    if not np.any(exposed):
+        return selected
+
+    visited = np.zeros_like(exposed, dtype=bool)
+    neighbors = [
+        (dr, dc)
+        for dr in (-1, 0, 1)
+        for dc in (-1, 0, 1)
+        if not (dr == 0 and dc == 0)
+    ]
+    best_rows = None
+    best_cols = None
+    best_key = None
+
+    for row, col in zip(*np.where(exposed)):
+        if visited[row, col]:
+            continue
+        stack = [(int(row), int(col))]
+        visited[row, col] = True
+        rows = []
+        cols = []
+        while stack:
+            r, c = stack.pop()
+            rows.append(r)
+            cols.append(c)
+            for dr, dc in neighbors:
+                nr = r + dr
+                nc = c + dc
+                if (
+                    0 <= nr < exposed.shape[0]
+                    and 0 <= nc < exposed.shape[1]
+                    and exposed[nr, nc]
+                    and not visited[nr, nc]
+                ):
+                    visited[nr, nc] = True
+                    stack.append((nr, nc))
+
+        rows_arr = np.asarray(rows, dtype=np.int64)
+        cols_arr = np.asarray(cols, dtype=np.int64)
+        mean_row = float(np.mean(rows_arr))
+        size = int(rows_arr.size)
+        key = (mean_row, size) if edge == 'top' else (-mean_row, size)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_rows = rows_arr
+            best_cols = cols_arr
+
+    selected[best_rows, best_cols] = True
+    return selected
+
+
+# =============================================================================
+# 真实数据读取：DEM / Excel
+# =============================================================================
 
 def load_real_case_data(data_cfg) -> RealCaseData:
-    """读取真实算例输入，并统一转换到 SI 单位。
-
-    DEM 提供初始床面和河道掩膜；Excel 提供非恒定边界过程线和床沙级配。
-    当前代码不读取 HEC-RAS 结果场，因此这些数据只作为输入条件，不作为监督标签。
+    """
+    读取真实算例输入，并统一转换到 SI 单位。
+    DEM 提供初始床面和河道掩膜；
+    Excel 提供非恒定边界过程线和床沙级配。
     """
     dem_path = Path(data_cfg['dem_path'])
     xlsx_path = Path(data_cfg['hydro_sediment_path'])
@@ -350,6 +450,10 @@ def _read_main_channel_gradation(path: Path):
     return diameters[keep].tolist(), fractions[keep].tolist()
 
 
+# =============================================================================
+# 真实流量/水位边界构造
+# =============================================================================
+
 class RealBoundaryConditionBuilder:
     def __init__(self, mesh, real_case: RealCaseData, typical_depth, typical_velocity,
                  simulation_time, h_min=0.05):
@@ -393,33 +497,32 @@ class RealBoundaryConditionBuilder:
     def _edge_payload(self, edge):
         """从 active_mask 自动抽取入口/出口断面离散点。
 
-        入口取活动河道最上方一行，出口取最下方一行。
-        每个活动单元贡献一个断面点，权重近似为 DEM 像元宽度。
+        top 入口先取 active 单元中上邻为空/非 active 的上边，再保留主连通段；
+        bottom 出口先取 active 单元中下邻为空/非 active 的下边，再保留主连通段。
+        每条暴露边贡献一个断面点，权重近似为 DEM 像元宽度。
         """
         mask = self.mesh.active_cell_mask_2d
         if edge == 'top':
-            row_candidates = np.where(mask.any(axis=1))[0]
-            row = int(row_candidates[-1])
-            cols = np.where(mask[row])[0]
-            y = self.mesh.bbox['ymax']
+            selected = select_boundary_component(mask, edge)
+            rows, cols = np.where(selected)
+            y = self.mesh.bbox['ymin'] + (rows + 1.0) * self.mesh.resolution
         elif edge == 'bottom':
-            row_candidates = np.where(mask.any(axis=1))[0]
-            row = int(row_candidates[0])
-            cols = np.where(mask[row])[0]
-            y = self.mesh.bbox['ymin']
+            selected = select_boundary_component(mask, edge)
+            rows, cols = np.where(selected)
+            y = self.mesh.bbox['ymin'] + rows * self.mesh.resolution
         else:
             raise ValueError("当前真实数据边界只实现 top/bottom。")
         if cols.size == 0:
             raise ValueError(f"{edge} 边界没有河道活动单元。")
         x = self.mesh.bbox['xmin'] + (cols + 0.5) * self.mesh.resolution
-        coords_phys = np.stack([x, np.full_like(x, y, dtype=np.float32)], axis=1)
+        coords_phys = np.stack([x, y.astype(np.float32)], axis=1)
         coords_norm = np.stack([
             (coords_phys[:, 0] - self.real_case.bounds['x_min'])
             / (self.real_case.bounds['x_max'] - self.real_case.bounds['x_min']),
             (coords_phys[:, 1] - self.real_case.bounds['y_min'])
             / (self.real_case.bounds['y_max'] - self.real_case.bounds['y_min']),
         ], axis=1).astype(np.float32)
-        cell_ids = row * self.mesh.nx + cols
+        cell_ids = rows * self.mesh.nx + cols
         return {
             'coords_norm': coords_norm,
             'weights': np.full(cols.size, self.mesh.resolution, dtype=np.float32),

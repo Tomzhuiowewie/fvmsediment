@@ -9,6 +9,7 @@ import time
 import torch
 import torch.nn.functional as F
 
+from .data import select_boundary_component
 from .model import FlowPINN
 from .utils import build_xyt
 
@@ -68,9 +69,14 @@ class DecoupledTrainer:
 
     这里不直接求解传统数值格式，而是把 PDE、边界条件和床变方程写成 loss：
     1. 先训练 flow_model，使 h/u/v 满足浅水方程和真实边界；
-    2. 冻结 flow_model，训练 sediment_model 的 C_k 和 Δzb；
-    3. 全时域更新 DEM/级配，并联合优化两个网络直到耦合收敛。
+    2. 冻结 flow_model，训练 sediment_model 的 C_k 和 Δzb_k；
+    3. 用 sediment_model 预测的分粒径床变更新 DEM/级配，并联合优化两个网络直到耦合收敛。
     """
+
+    # -------------------------------------------------------------------------
+    # 初始化、优化器和 history
+    # -------------------------------------------------------------------------
+
     def __init__(
         self,
         flow_model,
@@ -78,7 +84,7 @@ class DecoupledTrainer:
         fvm_mesh,
         device,
         flow_loss_fn,
-        sediment_transport_loss_fn,
+        sediment_loss_fn,
         simulation_time,
         initial_gradation=None,
         active_layer_thickness=0.5,
@@ -106,7 +112,7 @@ class DecoupledTrainer:
         self.mesh = fvm_mesh
         self.device = device
         self.flow_loss_fn = flow_loss_fn
-        self.sediment_transport_loss_fn = sediment_transport_loss_fn
+        self.sediment_loss_fn = sediment_loss_fn
         self.simulation_time = simulation_time
         self.active_layer_thickness = float(active_layer_thickness)
         self.sediment_cell_batch_size = int(sediment_cell_batch_size)
@@ -140,6 +146,16 @@ class DecoupledTrainer:
         # 固壁边界：active 河道单元与 inactive/外部相邻的边。
         # top 入口和 bottom 出口会被排除，不施加 no-flux。
         self.wall_gauss_mask = self._build_wall_gauss_mask()
+        self.wall_coords_t = torch.as_tensor(
+            self.mesh.gauss_coords[self.wall_gauss_mask],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.wall_normals_t = torch.as_tensor(
+            self.mesh.gauss_normals[self.wall_gauss_mask],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         # 三个优化器分别对应三阶段训练，避免手动开关参数组。
         self.flow_optimizer = torch.optim.Adam(self.flow_model.parameters(), lr=flow_lr)
@@ -222,6 +238,10 @@ class DecoupledTrainer:
             'stop_reason': {},
         }
 
+    # -------------------------------------------------------------------------
+    # Checkpoint 与通用训练辅助
+    # -------------------------------------------------------------------------
+
     def save_checkpoint(self, name):
         """保存阶段 checkpoint，长训练中断后至少保留已完成阶段结果。"""
         if not self.checkpoint_dir:
@@ -268,7 +288,7 @@ class DecoupledTrainer:
 
     def _init_gradation(self, initial_gradation):
         """用 Excel 级配初始化活动层；如果未提供，则退化为均匀级配。"""
-        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
+        n_grains = len(self.sediment_loss_fn.grain_diameters)
         if initial_gradation is None:
             base = np.full(n_grains, 1.0 / max(n_grains, 1), dtype=np.float32)
         else:
@@ -279,17 +299,16 @@ class DecoupledTrainer:
             base = base / np.sum(base)
         return np.tile(base.reshape(1, -1), (self.mesh.n_cells, 1)).astype(np.float32)
 
-    def _gradation_at_gauss_tensor(self):
-        """把单元活动层级配映射到高斯点，供输沙能力闭合使用。"""
-        p_gauss = self.active_layer_frac[self.mesh.gauss_cell_id]
-        return torch.tensor(p_gauss, dtype=torch.float32, device=self.device)
-
     def _active_cell_batches(self, batch_size):
         """把河道 active 单元切成小批，降低泥沙自动微分显存占用。"""
-        active = np.where(getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool)))[0]
+        active = self.mesh.active_cell_ids
         if batch_size is None or batch_size <= 0 or batch_size >= active.size:
             return [active]
         return [active[i:i + batch_size] for i in range(0, active.size, batch_size)]
+
+    # -------------------------------------------------------------------------
+    # 边界几何：固壁高斯点
+    # -------------------------------------------------------------------------
 
     def _build_wall_gauss_mask(self):
         """识别固壁边界高斯点。
@@ -313,20 +332,21 @@ class DecoupledTrainer:
         wall = current_active & (~neighbor_active)
 
         active_2d = getattr(self.mesh, 'active_cell_mask_2d', active.reshape(self.mesh.ny, self.mesh.nx))
-        active_rows = np.where(active_2d.any(axis=1))[0]
-        if active_rows.size == 0:
+        if not np.any(active_2d):
             return np.zeros_like(wall, dtype=bool)
 
-        top_row = int(active_rows[-1])
-        bottom_row = int(active_rows[0])
-        top_cols = np.where(active_2d[top_row, :])[0]
-        bottom_cols = np.where(active_2d[bottom_row, :])[0]
-        top_cell_ids = self.mesh.cell_index[top_row, top_cols]
-        bottom_cell_ids = self.mesh.cell_index[bottom_row, bottom_cols]
+        top_selected = select_boundary_component(active_2d, 'top')
+        bottom_selected = select_boundary_component(active_2d, 'bottom')
+        top_cell_ids = self.mesh.cell_index[top_selected]
+        bottom_cell_ids = self.mesh.cell_index[bottom_selected]
 
         inlet_mask = (edge_id == 2) & np.isin(cell_id, top_cell_ids)
         outlet_mask = (edge_id == 0) & np.isin(cell_id, bottom_cell_ids)
         return wall & (~inlet_mask) & (~outlet_mask)
+
+    # -------------------------------------------------------------------------
+    # 三阶段训练：flow / sediment / joint
+    # -------------------------------------------------------------------------
 
     def train_flow_phase(self, n_epochs, T_norm, bc_builder):
         """阶段 1：训练水动力 PINN。
@@ -334,13 +354,15 @@ class DecoupledTrainer:
         T_norm 可以是多个归一化时间点；每个 epoch 会在这些时间点上分别计算
         浅水方程残差和真实边界 loss，再取平均。
         """
-        time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         self.flow_model.train()
-        total_loss_value = 0.0
+        time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         progress = _ProgressBar('Flow PINN', n_epochs * len(time_list))
+        
+        total_loss_value = 0.0
         best_loss = None
-        stale_epochs = 0
+        stale_epochs = 0    # 连续若干 epoch loss 没有改善的计数器
         stop_reason = None
+
         for epoch in range(n_epochs):
             self.flow_optimizer.zero_grad()
             total_loss_value = 0.0
@@ -402,33 +424,40 @@ class DecoupledTrainer:
         """阶段 2：训练泥沙 PINN。
 
         freeze_flow_params=True 时，水动力场只作为已训练好的背景场提供 h/u/v，
-        梯度不会更新 flow_model；泥沙网络学习分粒径浓度 C_k 和累计床变 Δzb。
+        梯度不会更新 flow_model；泥沙网络学习分粒径浓度 C_k 和分粒径累计床变 Δzb_k。
         """
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         self.flow_model.eval()
         # 当前活动层级配会影响输沙能力闭合，因此每个训练阶段开始时映射到高斯点。
-        p_k_gauss = self._gradation_at_gauss_tensor()
+        p_gauss = self.active_layer_frac[self.mesh.gauss_cell_id]
+        p_k_gauss = torch.as_tensor(p_gauss, dtype=torch.float32, device=self.device)
+        # 泥沙损失按 cell batch 分摊计算，降低自动微分显存占用；每个 epoch 遍历所有时间点和 cell batch。
         cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
+        
         total_loss_value = 0.0
         progress = _ProgressBar('Sediment PINN', n_epochs * len(time_list) * len(cell_batches))
         best_loss = None
-        stale_epochs = 0
+        stale_epochs = 0 # 连续若干 epoch loss 没有改善的计数器
         stop_reason = None
 
         for epoch in range(n_epochs):
             total_loss_value = 0.0
             loss_acc = {
-                'transport': 0.0,
-                'capacity': 0.0,
-                'initial': 0.0,
-                'inlet': 0.0,
-                'bed_change': 0.0,
-                'bed_initial': 0.0,
-                'C_min': None,
-                'C_max': None,
-                'dzb_min': None,
-                'dzb_max': None,
-                'Ceq_mean': 0.0,
+                'transport': 0.0,   # 输沙 PDE 残差
+                'capacity': 0.0,    # C≈C_capacity 约束
+                'initial': 0.0,   # 初始条件约束
+                'inlet': 0.0,   # 入口平衡浓度约束
+                'bed_change': 0.0,  # Δzb_k 的 Exner 约束
+                'bed_initial': 0.0, # 初始床变约束
+                'weight_transport': 0.0,
+                'weight_capacity': 0.0,
+                'weight_inlet': 0.0,
+                'weight_bed_change': 0.0,
+                'C_min': None,  # 记录所有 cell batch 的 C_k 最小值，检查是否有负值或数值不稳定。
+                'C_max': None,  # 记录所有 cell batch 的 C_k 最大值，检查是否有数值不稳定。
+                'dzb_min': None,    # 记录所有 cell batch 的 Δzb_k 最小值，检查是否有过度侵蚀或数值不稳定。
+                'dzb_max': None,    # 记录所有 cell batch 的 Δzb_k 最大值，检查是否有过度淤积或数值不稳定。
+                'Ceq_mean': 0.0,    # 记录所有 cell batch 的 C_k/C_capacity 平均值，检查是否有普遍过度饱和或过稀释。
             }
             if self.sediment_model is not None and self.sediment_optimizer is not None:
                 self.sediment_model.train()
@@ -436,16 +465,18 @@ class DecoupledTrainer:
                 self.sediment_optimizer.zero_grad()
                 for t_i in time_list:
                     for cell_batch in cell_batches:
-                        # compute_sediment_loss 内部包含：
-                        # 输沙 PDE 残差、C≈C_capacity、入口平衡浓度、Δzb 的 Exner 约束。
-                        sediment_loss, sediment_dict = self.sediment_transport_loss_fn.compute_sediment_loss(
+
+                        # 输沙 PDE 残差、C≈C_capacity、入口平衡浓度、Δzb_k 的 Exner 约束。
+                        sediment_loss, sediment_dict = self.sediment_loss_fn.compute_sediment_loss(
                             self.sediment_model, self.flow_model, t_i, self.device,
                             p_k_override=p_k_gauss,
                             freeze_flow_params=freeze_flow_params,
                             cell_indices=cell_batch,
                         )
                         weight = 1.0 / (len(time_list) * len(cell_batches))
+                        
                         (sediment_loss * weight).backward()
+                        
                         total_loss_value += float(sediment_loss.detach().cpu()) * weight
                         loss_acc['transport'] += sediment_dict['transport'] * weight
                         loss_acc['capacity'] += sediment_dict['capacity'] * weight
@@ -453,6 +484,10 @@ class DecoupledTrainer:
                         loss_acc['inlet'] += sediment_dict['inlet'] * weight
                         loss_acc['bed_change'] += sediment_dict['bed_change'] * weight
                         loss_acc['bed_initial'] += sediment_dict['bed_initial'] * weight
+                        loss_acc['weight_transport'] += sediment_dict['weight_transport'] * weight
+                        loss_acc['weight_capacity'] += sediment_dict['weight_capacity'] * weight
+                        loss_acc['weight_inlet'] += sediment_dict['weight_inlet'] * weight
+                        loss_acc['weight_bed_change'] += sediment_dict['weight_bed_change'] * weight
                         loss_acc['Ceq_mean'] += sediment_dict['Ceq_mean'] * weight
                         loss_acc['C_min'] = (
                             sediment_dict['C_min']
@@ -489,6 +524,10 @@ class DecoupledTrainer:
                 self.history['inlet_sediment_loss'].append(loss_acc['inlet'])
                 self.history['bed_change_loss'].append(loss_acc['bed_change'])
                 self.history['bed_initial_loss'].append(loss_acc['bed_initial'])
+                self.history.setdefault('weight_transport', []).append(loss_acc['weight_transport'])
+                self.history.setdefault('weight_capacity', []).append(loss_acc['weight_capacity'])
+                self.history.setdefault('weight_inlet', []).append(loss_acc['weight_inlet'])
+                self.history.setdefault('weight_bed_change', []).append(loss_acc['weight_bed_change'])
                 self.history['C_min'].append(loss_acc['C_min'])
                 self.history['C_max'].append(loss_acc['C_max'])
                 self.history['dzb_min'].append(loss_acc['dzb_min'])
@@ -542,7 +581,7 @@ class DecoupledTrainer:
                 total_loss_value += float(flow_loss.detach().cpu()) / len(time_list)
                 progress.update(loss=total_loss_value)
                 for cell_batch in cell_batches:
-                    sediment_loss, _ = self.sediment_transport_loss_fn.compute_sediment_loss(
+                    sediment_loss, _ = self.sediment_loss_fn.compute_sediment_loss(
                         self.sediment_model,
                         self.flow_model,
                         t_i,
@@ -578,6 +617,10 @@ class DecoupledTrainer:
             print(f"  Early stop: {stop_reason}")
         return total_loss_value
 
+    # -------------------------------------------------------------------------
+    # 水动力真实边界 loss：入口流量、出口水位
+    # -------------------------------------------------------------------------
+
     def _balance_flow_boundary_loss(self, physics_loss, boundary_loss):
         """使边界损失的加权贡献与水动力 PDE 总损失保持同量级。"""
         physics_value = max(float(physics_loss.detach().cpu()), 1.0e-12)
@@ -609,9 +652,9 @@ class DecoupledTrainer:
         return physics_loss + weight * boundary_loss, weight
 
     def _compute_real_flow_boundary_loss(self, payload):
-        """真实边界损失：入口总流量、出口水位、侧壁 no-flux。"""
-        inlet_coords = torch.tensor(payload['inlet_coords'], dtype=torch.float32, device=self.device)
-        inlet_weights = torch.tensor(payload['inlet_weights'], dtype=torch.float32, device=self.device).view(-1, 1)
+        """真实边界损失：入口总流量、出口水位。"""
+        inlet_coords = torch.as_tensor(payload['inlet_coords'], dtype=torch.float32, device=self.device)
+        inlet_weights = torch.as_tensor(payload['inlet_weights'], dtype=torch.float32, device=self.device).view(-1, 1)
         inlet_out = self.flow_model(inlet_coords)
         h_in, _, v_in = FlowPINN.decode_output(
             inlet_out,
@@ -623,63 +666,26 @@ class DecoupledTrainer:
             q_pred = torch.sum(h_in * (-v_in) * inlet_weights)
         else:
             q_pred = torch.sum(h_in * v_in * inlet_weights)
-        q_target = torch.tensor(float(payload['target_flow']), dtype=torch.float32, device=self.device)
+        q_target = torch.as_tensor(float(payload['target_flow']), dtype=torch.float32, device=self.device)
         flow_loss = ((q_pred - q_target) / torch.clamp(torch.abs(q_target), min=1.0)) ** 2
 
-        outlet_coords = torch.tensor(payload['outlet_coords'], dtype=torch.float32, device=self.device)
-        outlet_bed = torch.tensor(payload['outlet_bed'], dtype=torch.float32, device=self.device).view(-1, 1)
+        outlet_coords = torch.as_tensor(payload['outlet_coords'], dtype=torch.float32, device=self.device)
+        outlet_bed = torch.as_tensor(payload['outlet_bed'], dtype=torch.float32, device=self.device).view(-1, 1)
         outlet_out = self.flow_model(outlet_coords)
         h_out, _, _ = FlowPINN.decode_output(
             outlet_out,
             payload['typical_depth'],
             payload['typical_velocity'],
         )
-        stage_target = torch.tensor(float(payload['target_stage']), dtype=torch.float32, device=self.device)
+        stage_target = torch.as_tensor(float(payload['target_stage']), dtype=torch.float32, device=self.device)
         # Excel 给的是绝对水位 stage，模型输出的是水深 h，所以需要 h=stage-zb。
         h_target = torch.clamp(stage_target - outlet_bed, min=float(payload.get('h_min', 0.05)))
         stage_loss = F.mse_loss(h_out, h_target) / max(float(payload['typical_depth']) ** 2, 1.0)
+        return flow_loss + stage_loss
 
-        # 固壁边界不允许水流穿过河道侧壁：u_n = u*nx + v*ny = 0。
-        wall_loss = self._compute_wall_no_flux_loss(
-            payload['t_norm'],
-            payload['typical_velocity'],
-        )
-        return flow_loss + stage_loss + wall_loss
-
-    def _compute_wall_no_flux_loss(self, t_norm, typical_velocity):
-        """侧壁 no-flux 损失。
-
-        在 active/inactive 交界边和外部侧壁边上，约束法向速度为 0。
-        这里只约束速度方向，不约束水深，因此不会和入口流量、出口水位冲突。
-        """
-        if not np.any(self.wall_gauss_mask):
-            return torch.zeros((), dtype=torch.float32, device=self.device)
-
-        coords = torch.tensor(
-            self.mesh.gauss_coords[self.wall_gauss_mask],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        normals = torch.tensor(
-            self.mesh.gauss_normals[self.wall_gauss_mask],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        xyt = build_xyt(
-            coords,
-            float(t_norm),
-            self.flow_loss_fn.bounds,
-            self.device,
-            requires_grad=False,
-        )
-        wall_out = self.flow_model(xyt)
-        _, u_wall, v_wall = FlowPINN.decode_output(
-            wall_out,
-            self.flow_loss_fn.typical_h,
-            self.flow_loss_fn.typical_u,
-        )
-        un = u_wall * normals[:, 0:1] + v_wall * normals[:, 1:2]
-        return torch.mean((un / max(float(typical_velocity), 1.0e-6)) ** 2)
+    # -------------------------------------------------------------------------
+    # 时间序列工具
+    # -------------------------------------------------------------------------
 
     def _time_slices(self, start_time, end_time, sample_dt):
         """生成训练采样时间点，并转为网络使用的归一化时间 t/T。"""
@@ -705,40 +711,20 @@ class DecoupledTrainer:
             times.append(float(simulation_time))
         return times
 
-    def predict_bed_history(self, output_times):
-        """仅用于对比网络累计床变输出，不参与正式形态推进。
-
-        sediment_model 直接输出累计床变 Δzb(x,y,t)，因此床面为：
-        zb(t) = zb_initial + Δzb(t)。
-        """
-        coords = torch.tensor(
-            np.stack([self.mesh.cell_centers_x, self.mesh.cell_centers_y], axis=1),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
-        bed_history = []
-        self.sediment_model.eval()
-        for t in output_times:
-            t_norm = float(t) / max(self.simulation_time, 1.0e-12)
-            xyt = build_xyt(coords, t_norm, self.sediment_transport_loss_fn.bounds, self.device, requires_grad=False)
-            with torch.no_grad():
-                sediment_out = self.sediment_model(xyt)
-                # 前 K 列是 C_k，最后一列才是累计床变 Δzb。
-                dzb = sediment_out[:, n_grains:n_grains + 1].squeeze(1).detach().cpu().numpy()
-            bed_history.append((self.mesh.zb_initial + dzb).astype(np.float32))
-        return bed_history
+    # -------------------------------------------------------------------------
+    # Exner 积分、DEM 更新和活动层级配更新
+    # -------------------------------------------------------------------------
 
     def _exner_rate_field(self, t_norm):
         """计算一个全局时刻所有活动单元的分粒径 Exner 床变率。"""
         self.flow_model.eval()
         self.sediment_model.eval()
-        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
+        n_grains = len(self.sediment_loss_fn.grain_diameters)
         rate = np.zeros((self.mesh.n_cells, n_grains), dtype=np.float64)
 
         for cell_batch in self._active_cell_batches(self.sediment_cell_batch_size):
             p_k_gauss = self._gradation_at_gauss_tensor()
-            closure = self.sediment_transport_loss_fn.compute_closure(
+            closure = self.sediment_loss_fn.compute_closure(
                 self.sediment_model,
                 self.flow_model,
                 t_norm,
@@ -748,7 +734,7 @@ class DecoupledTrainer:
                 cell_indices=cell_batch,
             )
             rate[cell_batch] = (
-                self.sediment_transport_loss_fn.exner_dzb_dt_k_cell(closure)
+                self.sediment_loss_fn.exner_dzb_dt_k_cell(closure)
                 .detach()
                 .cpu()
                 .numpy()
@@ -759,7 +745,8 @@ class DecoupledTrainer:
     def integrate_exner_history(self, times_norm, return_history=False):
         """在全时域上用梯形法积分分粒径 Exner 床变率。
 
-        每次耦合迭代都从零累计床变，因此不会把耦合迭代次数误当成物理时间。
+        该函数保留作 Exner 积分诊断。主耦合更新使用 sediment_model
+        直接预测的分粒径累计床变 Δzb_k。
         """
         times_norm = np.asarray(times_norm, dtype=np.float64).ravel()
         if times_norm.size == 0:
@@ -767,7 +754,7 @@ class DecoupledTrainer:
         if np.any(np.diff(times_norm) < 0.0):
             raise ValueError("Exner 积分时间点必须单调递增。")
 
-        n_grains = len(self.sediment_transport_loss_fn.grain_diameters)
+        n_grains = len(self.sediment_loss_fn.grain_diameters)
         cumulative_k = np.zeros((self.mesh.n_cells, n_grains), dtype=np.float64)
         bed_history = []
         gradation_history = []
@@ -790,6 +777,41 @@ class DecoupledTrainer:
             previous_time = physical_time
 
         return cumulative_k, bed_history, gradation_history
+
+    def predict_cumulative_bed_change(self, t_norm):
+        """用 SedimentPINN 在单元中心预测分粒径累计床变 Δzb_k。"""
+        self.sediment_model.eval()
+        n_grains = len(self.sediment_loss_fn.grain_diameters)
+        cumulative_k = np.zeros((self.mesh.n_cells, n_grains), dtype=np.float64)
+        coords_all = np.stack(
+            [self.mesh.cell_centers_x, self.mesh.cell_centers_y],
+            axis=1,
+        )
+
+        with torch.no_grad():
+            for cell_batch in self._active_cell_batches(self.sediment_cell_batch_size):
+                coords = torch.tensor(
+                    coords_all[cell_batch],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                xyt = build_xyt(
+                    coords,
+                    float(t_norm),
+                    self.sediment_loss_fn.bounds,
+                    self.device,
+                    requires_grad=False,
+                )
+                sediment_out = self.sediment_model(xyt)
+                dzb_raw = sediment_out[:, n_grains:]
+                if dzb_raw.shape[1] >= n_grains:
+                    dzb_k = dzb_raw[:, :n_grains]
+                elif dzb_raw.shape[1] == 1:
+                    dzb_k = dzb_raw.expand(-1, n_grains) / float(n_grains)
+                else:
+                    dzb_k = torch.zeros_like(sediment_out[:, :n_grains])
+                cumulative_k[cell_batch] = dzb_k.detach().cpu().numpy().astype(np.float64)
+        return cumulative_k
 
     def _state_from_cumulative_bed_change(self, cumulative_k):
         """由全时域累计分粒径床变构造绝对床面和活动层级配。"""
@@ -849,6 +871,10 @@ class DecoupledTrainer:
         base, remainder = divmod(total_epochs, n_iterations)
         return [base + (1 if i < remainder else 0) for i in range(n_iterations)]
 
+    # -------------------------------------------------------------------------
+    # Diagnostics：边界、场变量、固壁法向速度
+    # -------------------------------------------------------------------------
+
     def record_diagnostics(
         self,
         output_times,
@@ -857,10 +883,10 @@ class DecoupledTrainer:
         gradation_history=None,
     ):
         """在输出时刻记录物理诊断量，便于判断结果是否可信。"""
-        active_cell = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
+        active_cell = self.mesh.active_cell_mask
         active_gauss = active_cell[self.mesh.gauss_cell_id]
-        active_gauss_t = torch.tensor(active_gauss, dtype=torch.bool, device=self.device)
-        coords = torch.tensor(self.mesh.gauss_coords, dtype=torch.float32, device=self.device)
+        active_gauss_t = torch.as_tensor(active_gauss, dtype=torch.bool, device=self.device)
+        coords = torch.as_tensor(self.mesh.gauss_coords, dtype=torch.float32, device=self.device)
 
         self.flow_model.eval()
         if self.sediment_model is not None:
@@ -891,10 +917,10 @@ class DecoupledTrainer:
         self.active_layer_frac = final_gradation
 
     def _flow_boundary_diagnostics(self, payload):
-        inlet_coords = torch.tensor(payload['inlet_coords'], dtype=torch.float32, device=self.device)
-        inlet_weights = torch.tensor(payload['inlet_weights'], dtype=torch.float32, device=self.device).view(-1, 1)
-        outlet_coords = torch.tensor(payload['outlet_coords'], dtype=torch.float32, device=self.device)
-        outlet_bed = torch.tensor(payload['outlet_bed'], dtype=torch.float32, device=self.device).view(-1, 1)
+        inlet_coords = torch.as_tensor(payload['inlet_coords'], dtype=torch.float32, device=self.device)
+        inlet_weights = torch.as_tensor(payload['inlet_weights'], dtype=torch.float32, device=self.device).view(-1, 1)
+        outlet_coords = torch.as_tensor(payload['outlet_coords'], dtype=torch.float32, device=self.device)
+        outlet_bed = torch.as_tensor(payload['outlet_bed'], dtype=torch.float32, device=self.device).view(-1, 1)
 
         with torch.no_grad():
             h_in, _, v_in = FlowPINN.decode_output(
@@ -949,8 +975,8 @@ class DecoupledTrainer:
             'Ceq_mean_diag': 0.0,
             'dzb_min_diag': 0.0,
             'dzb_max_diag': 0.0,
-            'p_min_diag': float(np.min(self.active_layer_frac[getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))])),
-            'p_max_diag': float(np.max(self.active_layer_frac[getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))])),
+            'p_min_diag': float(np.min(self.active_layer_frac[self.mesh.active_cell_mask])),
+            'p_max_diag': float(np.max(self.active_layer_frac[self.mesh.active_cell_mask])),
             'wall_un_abs_mean': self._wall_un_abs_mean(t_norm),
         }
 
@@ -964,9 +990,9 @@ class DecoupledTrainer:
         dzb_max = None
         # 这里使用 compute_closure，是为了同时拿到 C、C_capacity 和 Δzb；
         # 按 cell batch 统计，避免诊断阶段再次占满显存。
+        p_k_gauss = self._gradation_at_gauss_tensor()
         for cell_batch in self._active_cell_batches(self.sediment_cell_batch_size):
-            p_k_gauss = self._gradation_at_gauss_tensor()
-            closure = self.sediment_transport_loss_fn.compute_closure(
+            closure = self.sediment_loss_fn.compute_closure(
                 self.sediment_model,
                 self.flow_model,
                 t_norm,
@@ -996,20 +1022,10 @@ class DecoupledTrainer:
 
     def _wall_un_abs_mean(self, t_norm):
         """诊断固壁边界平均法向速度绝对值。"""
-        if not np.any(self.wall_gauss_mask):
+        if self.wall_coords_t.numel() == 0:
             return 0.0
-        coords = torch.tensor(
-            self.mesh.gauss_coords[self.wall_gauss_mask],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        normals = torch.tensor(
-            self.mesh.gauss_normals[self.wall_gauss_mask],
-            dtype=torch.float32,
-            device=self.device,
-        )
         xyt = build_xyt(
-            coords,
+            self.wall_coords_t,
             float(t_norm),
             self.flow_loss_fn.bounds,
             self.device,
@@ -1022,8 +1038,12 @@ class DecoupledTrainer:
                 self.flow_loss_fn.typical_h,
                 self.flow_loss_fn.typical_u,
             )
-            un = u_wall * normals[:, 0:1] + v_wall * normals[:, 1:2]
+            un = u_wall * self.wall_normals_t[:, 0:1] + v_wall * self.wall_normals_t[:, 1:2]
         return float(torch.mean(torch.abs(un)).detach().cpu())
+
+    # -------------------------------------------------------------------------
+    # 完整训练编排
+    # -------------------------------------------------------------------------
 
     def run_training(
         self,
@@ -1038,8 +1058,8 @@ class DecoupledTrainer:
     ):
         """执行完整训练流程。
 
-        sample_dt 控制全时域训练和 Exner 积分时间点；
-        output_dt 只控制床面历史和图像输出时间。
+        sample_dt 控制全时域训练时间点；
+        output_dt 控制直接预测床面历史和图像输出时间。
         """
 
         self.simulation_time = float(simulation_time)
@@ -1054,7 +1074,7 @@ class DecoupledTrainer:
 
         if verbose:
             print(f'阶段 1 完成: Flow Loss={flow_loss:.2e}')
-            print('\n阶段 2/3: 冻结水动力，训练泥沙 PINN 和累计床变 Δzb')
+            print('\n阶段 2/3: 冻结水动力，训练泥沙 PINN 和分粒径累计床变 Δzb_k')
         self.save_checkpoint('phase1_flow')
 
         sediment_loss = self.train_sediment_phase(
@@ -1068,8 +1088,8 @@ class DecoupledTrainer:
             print('\n阶段 3/3: 联合优化水动力 PINN 和泥沙 PINN')
         self.save_checkpoint('phase2_sediment')
 
-        # 阶段 3：不划分形态窗口。每轮先由当前模型在全时域积分床变并更新
-        # DEM/级配，再在更新后的 DEM 上使用全部时间点联合优化两个网络。
+        # 阶段 3：不划分形态窗口。每轮先由当前泥沙 PINN 在最终时刻预测
+        # 分粒径累计床变并更新 DEM/级配，再在更新后的 DEM 上联合优化两个网络。
         joint_epochs = int(getattr(self, 'joint_epochs', 0))
         epoch_schedule = self._joint_epoch_schedule(
             joint_epochs,
@@ -1078,7 +1098,7 @@ class DecoupledTrainer:
         joint_loss = 0.0
         completed_iterations = 0
         for iteration, iteration_epochs in enumerate(epoch_schedule, start=1):
-            cumulative_k, _, _ = self.integrate_exner_history(T_norm_list)
+            cumulative_k = self.predict_cumulative_bed_change(1.0)
             bed_error = self.apply_coupled_state(cumulative_k)
             if verbose:
                 print(
@@ -1103,27 +1123,16 @@ class DecoupledTrainer:
                 break
         self.save_checkpoint('phase3_joint')
 
-        # 用最终联合模型重新积分，生成正式床面和级配历史。积分节点取训练
-        # 时间点与输出时间点的并集，避免 output_dt 较大时降低积分精度。
+        # 用最终联合模型直接预测各输出时刻的累计床变，生成正式床面和级配历史。
         output_times = self._output_times(simulation_time, output_dt)
-        sample_times = np.asarray(T_norm_list, dtype=np.float64) * self.simulation_time
-        integration_times = np.unique(np.concatenate([
-            sample_times,
-            np.asarray(output_times, dtype=np.float64),
-        ]))
-        integration_times_norm = (
-            integration_times / max(self.simulation_time, 1.0e-12)
-        )
-        _, integrated_beds, integrated_fractions = self.integrate_exner_history(
-            integration_times_norm,
-            return_history=True,
-        )
-        output_indices = np.searchsorted(
-            integration_times,
-            np.asarray(output_times, dtype=np.float64),
-        )
-        bed_history = [integrated_beds[i] for i in output_indices]
-        gradation_history = [integrated_fractions[i] for i in output_indices]
+        bed_history = []
+        gradation_history = []
+        for output_time in output_times:
+            t_norm = float(output_time) / max(self.simulation_time, 1.0e-12)
+            cumulative_k = self.predict_cumulative_bed_change(t_norm)
+            bed, fractions = self._state_from_cumulative_bed_change(cumulative_k)
+            bed_history.append(bed)
+            gradation_history.append(fractions)
         active = getattr(self.mesh, 'active_cell_mask', np.ones(self.mesh.n_cells, dtype=bool))
         projection_error = float(np.max(np.abs(
             bed_history[-1][active] - self.mesh.zb[active]
@@ -1137,7 +1146,7 @@ class DecoupledTrainer:
             bed_history=bed_history,
             gradation_history=gradation_history,
         )
-        self.history['integration_times'] = integration_times.tolist()
+        self.history['integration_times'] = output_times
         self.history['coupling_iterations_completed'] = completed_iterations
         self.history['output_times'] = output_times
         self.history['zb_min'] = [float(np.min(zb)) for zb in bed_history]

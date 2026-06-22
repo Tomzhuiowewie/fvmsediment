@@ -104,7 +104,13 @@ def _create_models(checkpoint, cfg, device):
     sediment_state = checkpoint["sediment_model"]
     flow_dims = _infer_architecture(flow_state)
     sediment_dims = _infer_architecture(sediment_state)
-    n_grains = sediment_dims[3] - 1
+    configured_grains = len(getattr(cfg, "grain_diameters", []) or [])
+    if configured_grains and sediment_dims[3] in (configured_grains + 1, 2 * configured_grains):
+        n_grains = configured_grains
+    elif sediment_dims[3] % 2 == 0:
+        n_grains = sediment_dims[3] // 2
+    else:
+        n_grains = sediment_dims[3] - 1
 
     flow_model = FlowPINN(*flow_dims).to(device)
     sediment_model = SedimentPINN(
@@ -326,7 +332,13 @@ def export(args):
             )
             sediment_raw = sediment_model(xyt)
             c_t = sediment_raw[:, :n_grains]
-            dzb_t = sediment_raw[:, n_grains]
+            dzb_raw = sediment_raw[:, n_grains:]
+            if dzb_raw.shape[1] >= n_grains:
+                dzb_t = torch.sum(dzb_raw[:, :n_grains], dim=1)
+            elif dzb_raw.shape[1] == 1:
+                dzb_t = dzb_raw[:, 0]
+            else:
+                dzb_t = torch.zeros_like(c_t[:, 0])
             p_t_np = (
                 initial_gradation
                 + t_norm * (final_gradation - initial_gradation)
@@ -399,9 +411,9 @@ def export(args):
             "h_u_v_concentration": "PINN direct evaluation at HEC-RAS cell centers",
             "bed_elevation": (
                 "bilinear interpolation of the initial DEM to HEC-RAS cell centers "
-                "plus the SedimentPINN cumulative bed-change output"
+                "plus the sum of SedimentPINN per-grain cumulative bed-change outputs"
             ),
-            "bed_change": "SedimentPINN final output evaluated directly at each x/y/t",
+            "bed_change": "sum of SedimentPINN per-grain bed-change outputs evaluated directly at each x/y/t",
             "capacity_and_shear": "Wu closure evaluated from PINN h/u/v and interpolated gradation",
             "sediment_units": (
                 "PINN volumetric concentration and capacity multiplied by sediment "

@@ -1,12 +1,12 @@
 data:
   dem_path: data/100ft.test1d.tif
   hydro_sediment_path: data/FlowSedimentData.xlsx
-  channel_elevation_threshold_ft: 680.0
+  channel_elevation_threshold_ft: 679
   inlet_edge: top
   outlet_edge: bottom
 
 fvm:
-  n_gauss_points: 1  # 真实 DEM 网格较大；正式训练先用 1 点高斯积分保证显存稳定
+  n_gauss_points: 2
 
 physics:
   include_time_terms: true
@@ -15,27 +15,28 @@ physics:
   output_dt: 86400  # 结果输出时间间隔（秒）
 
   flow:
-    typical_depth: 8
-    typical_velocity: 1.0
+    typical_depth: 10
+    typical_velocity: 5
     g: 9.81
     n_manning: 0.01  # 曼宁糙率
     adaptive_loss_weighting: true  # 自适应平衡连续方程与两个动量方程
     adaptive_weight_ema_decay: 0.95  # 原始损失量级的指数滑动平均系数
-    adaptive_weight_min: 0.05  # 单项权重下限
+    adaptive_weight_min: 0.2  # 单项权重下限，避免动量项被压得过低
     adaptive_weight_max: 20.0  # 单项权重上限
 
   sediment:
     # HEC-RAS FS-SC 粒径组的几何平均代表粒径，不是各组上界。
     grain_diameters: [0.000177, 0.000354, 0.000707, 0.001414, 0.002828, 0.005657, 0.01131, 0.02263, 0.04525, 0.09051]
-    beta_default: 1.0
-    epsilon_default: 0.1
+    beta_default: 0.6 # 总输沙修正系数
+    epsilon_default: 0.1  # 总输沙扩散/混合系数
+
     residual_scale: 1.0
     adaptation_length: 9.144
     rho_s: 2650.0
     rho_w: 1000.0
-    kinematic_viscosity: 0.000001
-    wu_theta_cr: 0.02
-    skin_shear_factor: 0.9
+    kinematic_viscosity: 0.000001 # 水动力粘度 (m²/s) 对应 20°C 的淡水
+    wu_theta_cr: 0.03
+    # skin_shear_factor: 0.9  # 颗粒糙率法计算 tau_skin 后的额外校准系数，最终仍限制 tau_skin <= tau_b
     alpha_active_layer: 10.0
     w_capacity: 1
     w_initial_sediment: 5
@@ -47,14 +48,14 @@ physics:
     porosity: 0.4
     active_layer_thickness: 0.5
     bed_slope_coefficient: 0.05
-    bed_change_scale: 0.1
+    bed_change_scale: 0.1 # 床面累计变化量缩放值
     exchange_weight: 1.0
     bed_slope_diffusion_weight: 1.0
 
 training:
-  flow_epochs: 200
-  sediment_epochs: 100
-  joint_epochs: 50  # 全部耦合迭代合计的联合训练 epoch
+  flow_epochs: 1
+  sediment_epochs: 1
+  joint_epochs: 2  # 全部耦合迭代合计的联合训练 epoch
   coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
   coupling_relaxation: 0.25  # 床面和级配固定点松弛系数
   coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
