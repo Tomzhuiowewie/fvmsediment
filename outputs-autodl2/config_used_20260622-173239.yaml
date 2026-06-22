@@ -1,0 +1,84 @@
+data:
+  dem_path: data/100ft.test1d.tif
+  hydro_sediment_path: data/FlowSedimentData.xlsx
+  channel_elevation_threshold_ft: 679
+  inlet_edge: top
+  outlet_edge: bottom
+
+fvm:
+  n_gauss_points: 2
+
+physics:
+  include_time_terms: true
+  simulation_time: 2937600  # 总模拟时间（秒）；对应 Excel 过程线约 34 天
+  sample_dt: 86400  # 训练采样时间间隔（秒）；当前按每天一个训练时刻
+  output_dt: 86400  # 结果输出时间间隔（秒）
+
+  flow:
+    typical_depth: 10
+    typical_velocity: 5
+    g: 9.81
+    n_manning: 0.01  # 曼宁糙率
+    adaptive_loss_weighting: false  # 当前关闭动态自适应；PDE 分项使用量级缩放后的固定权重
+    adaptive_weight_ema_decay: 0.95  # 兼容旧配置，关闭自适应时不参与训练
+    adaptive_weight_min: 0.2  # 兼容旧配置，关闭自适应时不参与训练
+    adaptive_weight_max: 20.0  # 兼容旧配置，关闭自适应时不参与训练
+    w_continuity: 1000000.0  # output-autodl2 中 continuity 约 1e-11，放大到与动量项接近
+    w_momentum_x: 5.0  # momentum_x 约 4e-6，放大到与 momentum_y 同量级
+    w_momentum_y: 1.0  # momentum_y 作为水动力 PDE 参考量级
+
+  sediment:
+    # HEC-RAS FS-SC 粒径组的几何平均代表粒径，不是各组上界。
+    grain_diameters: [0.000177, 0.000354, 0.000707, 0.001414, 0.002828, 0.005657, 0.01131, 0.02263, 0.04525, 0.09051]
+    beta_default: 0.6 # 总输沙修正系数
+    epsilon_default: 0.1  # 总输沙扩散/混合系数
+
+    residual_scale: 1.0
+    adaptation_length: 9.144
+    rho_s: 2650.0
+    rho_w: 1000.0
+    kinematic_viscosity: 0.000001 # 水动力粘度 (m²/s) 对应 20°C 的淡水
+    wu_theta_cr: 0.03
+    # skin_shear_factor: 0.9  # 颗粒糙率法计算 tau_skin 后的额外校准系数，最终仍限制 tau_skin <= tau_b
+    alpha_active_layer: 10.0
+    w_capacity: 0  # 当前 capacity_loss 只作诊断，不进入总损失
+    w_transport: 1.0  # transport_loss 约 9e-7，作为泥沙参考量级
+    w_initial_sediment: 100000.0  # 初始浓度只在 t=0 生效，适度提高但不压制输沙演化
+    w_bed_initial: 100000.0  # 初始床变只在 t=0 生效
+    initial_concentration: 0  # 接近当前水流输沙能力，避免清水全域冲刷
+    w_inlet_sediment: 5000.0  # inlet_loss 约 1e-10，拉近到 transport_loss 量级
+    source_sharpness: 0.000001
+
+  morphodynamics:
+    porosity: 0.4
+    active_layer_thickness: 0.5
+    bed_slope_coefficient: 0.05
+    bed_change_scale: 0.1 # 床面累计变化量缩放值
+    exchange_weight: 1.0
+    bed_slope_diffusion_weight: 1.0
+
+training:
+  flow_epochs: 200
+  sediment_epochs: 10
+  joint_epochs: 30  # 全部耦合迭代合计的联合训练 epoch
+  coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
+  coupling_relaxation: 0.25  # 床面和级配固定点松弛系数
+  coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
+  flow_boundary_weight: 0.01  # boundary_loss 约 8e-2，但上一轮边界误差大，给比纯拉平更强的权重
+  adaptive_boundary_weighting: false  # 当前关闭动态自适应，避免边界权重被压到下限
+  boundary_weight_ema_decay: 0.95
+  boundary_weight_min: 0.0001
+  boundary_weight_max: 1.0
+  flow_loss_tol: 0.0  # >0 时，水动力 loss 低于该值提前停止
+  sediment_loss_tol: 0.0  # >0 时，泥沙 loss 低于该值提前停止
+  joint_loss_tol: 0.0  # >0 时，联合 loss 低于该值提前停止
+  joint_flow_weight: 1.0  # 联合阶段水动力 block 权重
+  joint_sediment_weight: 10.0  # 联合阶段泥沙 block 权重，使其接近上一轮 joint flow 量级
+  early_stop_patience: 30  # 连续若干 epoch 改善不足则提前停止
+  early_stop_min_delta: 0  # 判断 loss 有效改善的最小幅度
+  sediment_cell_batch_size: 1024  # 泥沙分粒径自动微分显存占用大，按河道单元分批训练
+  flow_lr: 0.0005
+  transport_lr: 0.0005
+  w_bed_change: 1000.0  # bed_change_loss 约 7e-10，拉近到 transport_loss 量级
+  output_dir: outputs
+  checkpoint_dir: outputs/checkpoints

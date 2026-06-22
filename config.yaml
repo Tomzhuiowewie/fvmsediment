@@ -41,12 +41,12 @@ physics:
     wu_theta_cr: 0.03
     # skin_shear_factor: 0.9  # 颗粒糙率法计算 tau_skin 后的额外校准系数，最终仍限制 tau_skin <= tau_b
     alpha_active_layer: 10.0
-    w_capacity: 0  # 当前 capacity_loss 只作诊断，不进入总损失
-    w_transport: 1.0  # transport_loss 约 9e-7，作为泥沙参考量级
-    w_initial_sediment: 100000.0  # 初始浓度只在 t=0 生效，适度提高但不压制输沙演化
-    w_bed_initial: 100000.0  # 初始床变只在 t=0 生效
-    initial_concentration: 0  # 接近当前水流输沙能力，避免清水全域冲刷
-    w_inlet_sediment: 5000.0  # inlet_loss 约 1e-10，拉近到 transport_loss 量级
+    w_capacity: 1000.0  # 弱容量约束，避免 C 长期贴着初始小值
+    w_transport: 1000.0  # 泥沙 loss 整体放大，提高梯度信号
+    w_initial_sediment: 100000000.0  # 初始浓度只在 t=0 生效
+    w_bed_initial: 100000000.0  # 初始床变只在 t=0 生效
+    initial_concentration: 0.000001  # 微小非零初值，确保输沙 PDE 残差有驱动力
+    w_inlet_sediment: 5000000.0  # inlet_loss 放大到与 transport 同量级
     source_sharpness: 0.000001
 
   morphodynamics:
@@ -58,9 +58,9 @@ physics:
     bed_slope_diffusion_weight: 1.0
 
 training:
-  flow_epochs: 1
-  sediment_epochs: 1
-  joint_epochs: 1  # 全部耦合迭代合计的联合训练 epoch
+  flow_epochs: 200
+  sediment_epochs: 200
+  joint_epochs: 200  # 全部耦合迭代合计的联合训练 epoch
   coupling_iterations: 5  # 全时域 DEM-水动力-泥沙固定点迭代次数
   coupling_relaxation: 0.25  # 床面和级配固定点松弛系数
   coupling_bed_tol: 0.00001  # 相邻耦合迭代最大床面变化收敛阈值（m）
@@ -79,6 +79,6 @@ training:
   sediment_cell_batch_size: 1024  # 泥沙分粒径自动微分显存占用大，按河道单元分批训练
   flow_lr: 0.0005
   transport_lr: 0.0005
-  w_bed_change: 1000.0  # bed_change_loss 约 7e-10，拉近到 transport_loss 量级
-  output_dir: outputs
-  checkpoint_dir: outputs/checkpoints
+  w_bed_change: 1000000.0  # bed_change_loss 放大到与 transport 同量级
+  output_dir: outputs-autodl2
+  checkpoint_dir: outputs-autodl2/checkpoints
