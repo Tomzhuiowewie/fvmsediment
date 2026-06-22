@@ -383,7 +383,7 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
     def _sediment_adaptive_weights(self, losses):
         """对持续存在的泥沙 loss 项做相对下降进度平衡。
 
-        只平衡 transport/capacity/inlet/bed_change。初始条件项只在 t=0 生效，
+        只平衡 transport/inlet/bed_change。初始条件项只在 t=0 生效，
         继续使用固定权重，避免把单一时刻约束混入全时域动态权重。
         """
         values = np.asarray(
@@ -695,8 +695,8 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         exner_dzb_dt_k_cell = self.exner_dzb_dt_k_cell(closure)
         bed_change_loss = torch.mean((dzb_t_k_cell - exner_dzb_dt_k_cell) ** 2)
 
-        # 容量闭合：C_capacity 只作为目标，不让该项反向拉动水动力闭合公式
-        # capacity_loss = torch.mean((C_tk - C_capacity.detach()) ** 2)
+        # 容量闭合项当前不进入总损失，仅保留 C_capacity 诊断和入口平衡目标。
+        capacity_loss = torch.zeros_like(transport_loss)
 
         # 初始条件只在 t=0 生效，避免把所有时刻都压到初始浓度。
         initial_loss = self.initial_condition_loss(C_tk) if abs(float(T_norm)) < 1.0e-8 else torch.zeros_like(capacity_loss)
@@ -713,14 +713,12 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
 
         sediment_weights = self._sediment_adaptive_weights([
             transport_loss,
-            # capacity_loss,
             inlet_loss,
             bed_change_loss,
         ])
         weighted_transport = transport_loss * float(sediment_weights[0])
-        # weighted_capacity = self.w_capacity * capacity_loss * float(sediment_weights[1])
-        weighted_inlet = self.w_inlet_sediment * inlet_loss * float(sediment_weights[2])
-        weighted_bed_change = self.w_bed_change * bed_change_loss * float(sediment_weights[3])
+        weighted_inlet = self.w_inlet_sediment * inlet_loss * float(sediment_weights[1])
+        weighted_bed_change = self.w_bed_change * bed_change_loss * float(sediment_weights[2])
 
         loss = (
             weighted_transport
@@ -733,19 +731,18 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         
         return loss, {
             'transport': transport_loss.item(),
-            #'capacity': capacity_loss.item(),
+            'capacity': capacity_loss.item(),
             'initial': initial_loss.item(),
             'inlet': inlet_loss.item(),
             'bed_change': bed_change_loss.item(),
             'bed_initial': bed_initial_loss.item(),
             'weighted_transport': weighted_transport.item(),
-            #'weighted_capacity': weighted_capacity.item(),
             'weighted_inlet': weighted_inlet.item(),
             'weighted_bed_change': weighted_bed_change.item(),
             'weight_transport': float(sediment_weights[0]),
-            'weight_capacity': float(sediment_weights[1]),
-            'weight_inlet': float(sediment_weights[2]),
-            'weight_bed_change': float(sediment_weights[3]),
+            'weight_capacity': 0.0,
+            'weight_inlet': float(sediment_weights[1]),
+            'weight_bed_change': float(sediment_weights[2]),
             'residual_mean': torch.mean(torch.abs(residual)).item(),
             'C_min': torch.min(C_tk).item(),
             'C_max': torch.max(C_tk).item(),
