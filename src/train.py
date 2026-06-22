@@ -421,6 +421,7 @@ class DecoupledTrainer:
         for epoch in range(n_epochs):
             self.flow_optimizer.zero_grad()
             total_loss_value = 0.0
+            steps_in_epoch = 0
             loss_keys = (
                 'continuity',
                 'momentum_x',
@@ -444,6 +445,7 @@ class DecoupledTrainer:
                     physics_loss,
                     boundary_loss,
                 )
+                steps_in_epoch += 1
                 (step_loss / len(time_list)).backward()
                 total_loss_value += float(step_loss.detach().cpu()) / len(time_list)
                 for key in loss_acc:
@@ -452,7 +454,8 @@ class DecoupledTrainer:
                 boundary_loss_acc += boundary_value / len(time_list)
                 boundary_weight_acc += boundary_weight / len(time_list)
                 weighted_boundary_acc += boundary_weight * boundary_value / len(time_list)
-                progress.update(loss=total_loss_value)
+                display_loss = total_loss_value / max(steps_in_epoch / len(time_list), 1.0e-12)
+                progress.update(loss=display_loss)
             torch.nn.utils.clip_grad_norm_(self.flow_model.parameters(), max_norm=1.0)
             self.flow_optimizer.step()
             self.flow_scheduler.step(total_loss_value)
@@ -505,6 +508,7 @@ class DecoupledTrainer:
 
         for epoch in range(n_epochs):
             total_loss_value = 0.0
+            steps_in_epoch = 0
             loss_acc = {
                 'transport': 0.0,   # 输沙 PDE 残差
                 'capacity': 0.0,    # C≈C_capacity 约束
@@ -541,6 +545,7 @@ class DecoupledTrainer:
                             cell_indices=cell_batch,
                         )
                         weight = 1.0 / (len(time_list) * len(cell_batches))
+                        steps_in_epoch += 1
                         
                         (sediment_loss * weight).backward()
                         
@@ -580,13 +585,15 @@ class DecoupledTrainer:
                             if loss_acc['dzb_max'] is None
                             else max(loss_acc['dzb_max'], sediment_dict['dzb_max'])
                         )
+                        progress_fraction = steps_in_epoch * weight
+                        display_loss = total_loss_value / max(progress_fraction, 1.0e-12)
                         progress.update(
-                            loss=total_loss_value,
+                            loss=display_loss,
                             info=(
-                                f"tr={loss_acc['weighted_transport']:.2e} "
-                                f"cap={loss_acc['weighted_capacity']:.2e} "
-                                f"in={loss_acc['weighted_inlet']:.2e} "
-                                f"bed={loss_acc['weighted_bed_change']:.2e}"
+                                f"avg tr={loss_acc['weighted_transport'] / max(progress_fraction, 1.0e-12):.2e} "
+                                f"cap={loss_acc['weighted_capacity'] / max(progress_fraction, 1.0e-12):.2e} "
+                                f"in={loss_acc['weighted_inlet'] / max(progress_fraction, 1.0e-12):.2e} "
+                                f"bed={loss_acc['weighted_bed_change'] / max(progress_fraction, 1.0e-12):.2e}"
                             ),
                         )
 
