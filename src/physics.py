@@ -357,7 +357,7 @@ class SedimentPhysicsLoss(_CachedMeshTensors):
         self._grain_diameters_cache = {}
         self._sediment_loss_ema = None
         self._sediment_loss_ref = None
-        self._sediment_loss_weights = np.ones(4, dtype=np.float64)
+        self._sediment_loss_weights = np.ones(3, dtype=np.float64)
         self.closure_formula = ClosureFormulation(SimpleNamespace(
             rho_w=self.rho_w,
             rho_s=self.rho_s,

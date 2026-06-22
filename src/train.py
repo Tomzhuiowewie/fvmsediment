@@ -306,6 +306,11 @@ class DecoupledTrainer:
             return [active]
         return [active[i:i + batch_size] for i in range(0, active.size, batch_size)]
 
+    def _gradation_at_gauss_tensor(self):
+        """把单元活动层级配 p_k 映射到每个高斯点。"""
+        p_gauss = self.active_layer_frac[self.mesh.gauss_cell_id]
+        return torch.as_tensor(p_gauss, dtype=torch.float32, device=self.device)
+
     # -------------------------------------------------------------------------
     # 边界几何：固壁高斯点
     # -------------------------------------------------------------------------
@@ -429,8 +434,7 @@ class DecoupledTrainer:
         time_list = [float(t) for t in np.asarray(T_norm, dtype=np.float32).ravel()]
         self.flow_model.eval()
         # 当前活动层级配会影响输沙能力闭合，因此每个训练阶段开始时映射到高斯点。
-        p_gauss = self.active_layer_frac[self.mesh.gauss_cell_id]
-        p_k_gauss = torch.as_tensor(p_gauss, dtype=torch.float32, device=self.device)
+        p_k_gauss = self._gradation_at_gauss_tensor()
         # 泥沙损失按 cell batch 分摊计算，降低自动微分显存占用；每个 epoch 遍历所有时间点和 cell batch。
         cell_batches = self._active_cell_batches(self.sediment_cell_batch_size)
         
